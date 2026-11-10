@@ -2742,7 +2742,7 @@ startWA();
         os.system('tar -xzf auth_info.tar.gz')
     
     print("🌐 جاري تشغيل جسر الواتساب الداخلي...")
-    subprocess.Popen(['node', 'wa.js'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.Popen(['node', 'wa.js'])
     time.sleep(4)
 
 def main():
