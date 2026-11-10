@@ -2746,6 +2746,11 @@ startWA();
     time.sleep(4)
 
 def main():
+    import os
+    if os.path.exists('auth_info.tar.gz') and not os.path.exists('auth_info'):
+        os.system('tar -xzf auth_info.tar.gz')
+        print("✅ تم فك ضغط الجلسة بنجاح!")
+    
     print("🚀 بدء MATARI MAIL PRO...")
     run_health_check()
     
