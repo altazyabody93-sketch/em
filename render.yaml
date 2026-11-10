@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: matari-mail-pro
+    env: python
+    buildCommand: pip install -r requirements.txt && npm install
+    startCommand: python3 em.py
