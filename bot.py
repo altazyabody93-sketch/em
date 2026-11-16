@@ -2721,7 +2721,7 @@ def main():
                              types.BotCommand("cancel", "إلغاء العملية الحالية")])
     except Exception: pass
     threading.Thread(target=poller_loop, daemon=True, name="site-sync").start()
-    notify_admins("✅ <b>البوت يعمل الآن</b> — متزامن مع الموقع.\n🗄 <code>%s</code>\n🕒 %s" % (E(os.path.basename(DB_PATH)), now_s()),
+    notify_admins("✅ <b>البوت يعمل الآن</b> — متزامن مع الموقع.\n🗄 <code>%s</code>\n🕒 %s" % (e(os.path.basename(DB_PATH)), now_s()),
                   K([B("👑 لوحة المدير", "a")]))
     while True:
         try:
