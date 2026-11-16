@@ -34,8 +34,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get("MATARI_DB_PATH") or os.path.join(BASE_DIR, "matari.db")
 BOT_LOG = os.path.join(BASE_DIR, "bot.log")
 
-ENV_TOKEN = os.environ.get("BOT_TOKEN", "7798949296:AAENslF2-nCqfyIttMdRFQfVtALSxRZspY8").strip()
-ENV_ADMINS = {int(x) for x in re.findall(r"\d+", os.environ.get("ADMIN_IDS", "7325566792"))}
+ENV_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+ENV_ADMINS = {int(x) for x in re.findall(r"\d+", os.environ.get("ADMIN_IDS", ""))}
 PAGE = 6                       # عناصر كل صفحة
 OTP_LIFETIME = 3 * 24 * 3600   # مدة السماح بطلب الكود بعد الشراء (3 أيام — نفس الموقع)
 OTP_COOLDOWN = 10              # ثواني بين كل طلب كود وآخر (نفس الموقع)
@@ -974,6 +974,8 @@ class T:
         s += fld("💵", "الرصيد", money(u["balance"]))
         s += fld("🆔", "الآيدي", cid_tag(u))
         s += fld("📦", "أرقامي", "<b>%d</b>" % count_my_numbers(u["user_id"]))
+        if str(u["username"]).startswith("tg_"):
+            s += "\n🔐 <b>عندك حساب في الموقع؟</b> سجّل دخولك بنفس حسابك لتظهر أرصدتك ومشترياتك هنا.\n"
         if ann: s += "\n📢 <i>%s</i>\n" % e(ann["text"][:160])
         s += "\n%s\n✨ اختر من القائمة 👇" % THIN
         return s
@@ -1136,6 +1138,9 @@ def main_kb(tg_id):
         [B("🎧 الدعم الفني", "sup"), B("👥 الإحالات", "ref")],
         [B("🔗 ربط حساب الموقع", "lnk"), B("🔐 بيانات الموقع", "acc")],
     ]
+    me = user_by_tg(tg_id)
+    if me and str(me["username"]).startswith("tg_"):      # حساب مؤقت بالبوت = غير مربوط بحساب الموقع
+        rows_.insert(0, [B("🔐 تسجيل الدخول بحساب الموقع", "lnk", style=BTN.PRIMARY)])
     if is_admin_tg(tg_id): rows_.append([B("👑 لوحة المدير", "a")])
     return K(*rows_)
 
@@ -2787,16 +2792,19 @@ def poller_loop():
 # ============================================================
 #  22) التشغيل
 # ============================================================
-def _single_instance():
+def _single_instance(background=False):
     try:
-        import fcntl
-        fh = open(os.path.join(BASE_DIR, ".bot.lock"), "w")
+        import fcntl, tempfile
+        fh = open(os.path.join(tempfile.gettempdir(), "matari_bot.lock"), "w")
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return fh
     except ImportError:
         return True
     except OSError:
-        print("⚠️ البوت يعمل بالفعل في عملية أخرى. أوقفه أولاً (pkill -f bot.py)."); sys.exit(1)
+        msg = "البوت يعمل بالفعل في عملية أخرى."
+        logger.info(msg)
+        if background: raise SystemExit(0)
+        print("⚠️ " + msg + " أوقفه أولاً (pkill -f bot.py)."); sys.exit(1)
 
 def _start_health_server():
     """اختياري لـ Render (Web Service): BOT_HEALTH_SERVER=1 يفتح منفذ PORT لفحص الصحة. لا تفعّله لو web.py يعمل في نفس الخدمة."""
@@ -2811,14 +2819,15 @@ def _start_health_server():
     threading.Thread(target=srv.serve_forever, daemon=True, name="health").start()
     logger.info("health server on port %s", os.environ.get("PORT", "10000"))
 
-def main():
-    lock = _start_lock = _single_instance()
-    _start_health_server()
+def main(background=False):
+    lock = _start_lock = _single_instance(background)
+    if not background: _start_health_server()
     ensure_schema()
     token = ENV_TOKEN or (get_setting("BOT_TOKEN", "") or "").strip()
     if not token:
         # أول تشغيل: يطلب التوكن ويحفظه في قاعدة البيانات، بدون أوامر خارجية
-        if not sys.stdin.isatty():
+        if background or not sys.stdin.isatty():
+            logger.error("BOT_TOKEN غير مضبوط (متغير البيئة أو الإعدادات). البوت متوقف.")
             print("❌ لم يتم ضبط BOT_TOKEN (متغير البيئة أو الإعدادات). البوت متوقف.")
             sys.exit(1)
         token = input("🔑 أدخل توكن البوت من BotFather: ").strip()
@@ -2837,6 +2846,7 @@ def main():
     try:
         me = bot.get_me(); logger.info("Bot @%s started | DB=%s | admins=%s", me.username, DB_PATH, sorted(admin_ids()))
     except Exception as ex:
+        logger.error("فشل الاتصال بتيليجرام (تحقق من التوكن/الإنترنت): %s", ex)
         print("❌ فشل الاتصال بتيليجرام (تحقق من التوكن/الإنترنت):", ex); sys.exit(1)
     try:
         sell_db_init()
@@ -2859,6 +2869,20 @@ def main():
             break
         except Exception:
             logger.error("polling crashed, retry in 5s:\n%s", traceback.format_exc()); time.sleep(5)
+
+def start_in_background():
+    """يُستدعى من web.py: يشغّل البوت في خيط خلفي داخل نفس عملية الموقع،
+    فيستخدمان نفس ملف matari.db بالضبط (مزامنة كاملة بلا أي إعداد إضافي)."""
+    def run():
+        try:
+            main(background=True)
+        except SystemExit:
+            pass
+        except Exception:
+            logger.error("bot thread crashed:\n%s", traceback.format_exc())
+    t = threading.Thread(target=run, daemon=True, name="telegram-bot")
+    t.start()
+    return t
 
 if __name__ == "__main__":
     main()
