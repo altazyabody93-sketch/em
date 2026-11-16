@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
 # ============================================================
+#  النسخة النهائية — فهرس الأقسام: 1 الإعدادات · 2 قاعدة البيانات · 3 المخطط · 4 المستخدمون · 5 المتجر · 6 الأكواد
+#  7 الشحن/التحويل · 8 الدعم · 9 الإدارة · 10 القوالب والأزرار · 11+ المعالجات · المزامنة · التشغيل
+# ============================================================
 #  MATARI STORE — Telegram Bot (bot.py)
 #  بوت تيليجرام متكامل ومتزامن بالكامل مع الموقع (web.py)
 #  يقرأ ويكتب في نفس قاعدة البيانات matari.db — بدون تعديل أي سطر في web.py
@@ -827,7 +830,40 @@ def usd(x):
 def site_name(): return get_setting("SITE_NAME", "MATARI STORE") or "MATARI STORE"
 def plat_label(p): return "🔵 تيليجرام" if "telegram" in (p or "").lower() else "🟢 واتساب"
 
-def B(text, data=None, url=None):
+class BTN:
+    """أنماط الأزرار المدعومة رسمياً في Telegram Bot API (حقل style)"""
+    PRIMARY = "primary"   # أزرق  - للعمليات الرئيسية
+    SUCCESS = "success"   # أخضر  - للتأكيد والنجاح
+    DANGER = "danger"     # أحمر  - للحذف والإلغاء
+    DEFAULT = None        # افتراضي
+
+BTN_COLORS = os.environ.get("BTN_COLORS", "1") != "0"   # BTN_COLORS=0 لإيقاف الألوان
+
+class _StyledButton(types.InlineKeyboardButton):
+    """زر ملوّن: يضيف حقل style لطلب Bot API. العملاء القدامى يعرضونه بدون لون بلا أي مشكلة."""
+    def __init__(self, *a, style=None, **k):
+        super().__init__(*a, **k)
+        self._style = style
+    def to_dict(self):
+        d = super().to_dict()
+        if self._style: d["style"] = self._style
+        return d
+
+def _auto_style(text):
+    t = text or ""
+    if any(x in t for x in ("❌", "🗑", "🚫", "✖", "⛔", "🔨")): return BTN.DANGER
+    if any(x in t for x in ("✅", "➕", "🎁", "🔑", "🛒")): return BTN.SUCCESS
+    if any(x in t for x in ("🏠", "👑", "👤", "💰", "📦", "💸", "🎧", "⚙️", "🔗")): return BTN.PRIMARY
+    return BTN.DEFAULT
+
+def B(text, data=None, url=None, style=None):
+    """زر Inline. style=BTN.SUCCESS/DANGER/PRIMARY لتحديد اللون يدوياً، وإلا يُحدَّد تلقائياً من رمز الزر."""
+    st = (style or _auto_style(text)) if BTN_COLORS else None
+    if st:
+        try:
+            return _StyledButton(text, url=url, style=st) if url else _StyledButton(text, callback_data=data, style=st)
+        except Exception:
+            pass
     if url: return types.InlineKeyboardButton(text, url=url)
     return types.InlineKeyboardButton(text, callback_data=data)
 
@@ -887,22 +923,58 @@ def pager_row(prefix, page, pages):
     if page < pages - 1: r.append(B("التالي ➡️", "%s:%d" % (prefix, page + 1)))
     return r
 
-# ---------------- القوالب (Templates) ----------------
+# ---------------- القوالب (Templates) — زخرفة + ترتيب + ألوان ----------------
+ORN = "✦━━━━━━━━━━━━━━━━━━✦"
+SEP = "╞══════════════════╡"
+LEVELS = ["⚪ مبتدئ", "🥉 برونزي", "🥈 فضي", "🥇 ذهبي", "💎 ماسي"]
+
+def money(x):
+    """💵 المبلغ مع مؤشر لوني: 🟢 رصيد جيد · 🟡 رصيد قليل · 🔴 صفر."""
+    try: v = float(x)
+    except Exception: v = 0.0
+    dot = "🟢" if v >= 1 else ("🟡" if v > 0 else "🔴")
+    return "%s <b>%s</b>" % (dot, usd(v))
+
+def fld(icon, label, value):
+    return "┃ %s %s ⟫ %s\n" % (icon, label, value)
+
+def cid_tag(u):
+    return "<code>%s</code>" % e(u["custom_id"] or u["user_id"])
+
+def bar(pct, n=10):
+    pct = max(0.0, min(100.0, pct)); f = int(round(pct / 100 * n))
+    return "▰" * f + "▱" * (n - f) + " %d%%" % int(pct)
+
+def vip_level(spent):
+    tiers = []
+    for part in (get_setting("VIP_TIERS", "5:3,20:5,50:10") or "").split(","):
+        try:
+            need, disc = part.strip().split(":"); tiers.append((float(need), float(disc)))
+        except Exception:
+            continue
+    tiers.sort()
+    lvl, prev = 0, 0.0
+    for i, (need, _d) in enumerate(tiers, 1):
+        if spent >= need: lvl, prev = i, need
+    nxt = next((n for n, _d in tiers if spent < n), None)
+    pct = 100.0 if nxt is None else ((spent - prev) / (nxt - prev) * 100 if nxt > prev else 0)
+    return LEVELS[min(lvl, len(LEVELS) - 1)], pct, nxt
+
 class T:
     @staticmethod
     def banner(title, icon="🏪"):
-        return "╭" + "─" * 18 + "╮\n  %s <b>%s</b>\n╰" % (icon, E(title)) + "─" * 18 + "╯\n"
+        return "%s\n  %s  <b>%s</b>\n%s\n" % (ORN, icon, e(title), ORN)
 
     @staticmethod
     def welcome(u, new=False):
         ann = row("SELECT text FROM announcements WHERE is_active=1 ORDER BY id DESC LIMIT 1")
         name = u["tg_name"] or u["username"]
         s = T.banner(site_name())
-        s += ("🎉 <b>تم إنشاء حسابك بنجاح!</b>\n" if new else "👋 أهلاً بعودتك،") + " <b>%s</b>\n\n" % E(name)
-        s += "💰 الرصيد  ‹ <code>%s</code> ›\n" % usd(u["balance"])
-        s += "🆔 الآيدي  ‹ <code>%s</code> ›\n" % E(u["custom_id"] or u["user_id"])
-        s += "📦 أرقامي  ‹ <b>%d</b> ›\n" % count_my_numbers(u["user_id"])
-        if ann: s += "\n📢 <i>%s</i>\n" % E(ann["text"][:160])
+        s += ("🎉 <b>تم إنشاء حسابك بنجاح!</b>\n" if new else "👋 أهلاً بعودتك،") + " <b>%s</b>\n\n" % e(name)
+        s += fld("💵", "الرصيد", money(u["balance"]))
+        s += fld("🆔", "الآيدي", cid_tag(u))
+        s += fld("📦", "أرقامي", "<b>%d</b>" % count_my_numbers(u["user_id"]))
+        if ann: s += "\n📢 <i>%s</i>\n" % e(ann["text"][:160])
         s += "\n%s\n✨ اختر من القائمة 👇" % THIN
         return s
 
@@ -912,59 +984,96 @@ class T:
         spent = scalar("SELECT COALESCE(SUM(COALESCE(paid_price,price)),0) FROM numbers WHERE buyer_id=? AND status='sold'", (u["user_id"],))
         pend = scalar("SELECT COUNT(*) FROM deposits WHERE user_id=? AND status='pending'", (u["user_id"],))
         s = T.banner("محفظتي", "💰")
-        s += "💵 الرصيد الحالي\n<b><code>%s</code></b>\n\n%s\n" % (usd(u["balance"]), THIN)
-        s += "📥 إجمالي الشحن:  <code>%s</code>\n🛍 إجمالي المشتريات:  <code>%s</code>\n" % (usd(dep), usd(spent))
-        s += "🆔 آيدي التحويل:  <code>%s</code>\n" % E(u["custom_id"] or u["user_id"])
-        if pend: s += "⏳ طلبات شحن معلّقة:  <b>%d</b>\n" % pend
+        s += "\n💵 <b>الرصيد الحالي</b>\n   ⟫  %s\n\n%s\n" % (money(u["balance"]), SEP)
+        s += fld("📥", "إجمالي الشحن", "<code>%s</code>" % usd(dep))
+        s += fld("🛍", "إجمالي المشتريات", "<code>%s</code>" % usd(spent))
+        s += fld("🆔", "آيدي التحويل", cid_tag(u))
+        if pend: s += fld("⏳", "طلبات شحن معلّقة", "<b>%d</b>" % pend)
+        return s
+
+    @staticmethod
+    def profile(u):
+        uid = u["user_id"]
+        dep = scalar("SELECT COALESCE(SUM(amount_usd),0) FROM deposits WHERE user_id=? AND status='approved'", (uid,))
+        spent = scalar("SELECT COALESCE(SUM(COALESCE(paid_price,price)),0) FROM numbers WHERE buyer_id=? AND status='sold'", (uid,))
+        cnt = scalar("SELECT COUNT(*) FROM numbers WHERE buyer_id=? AND status='sold'", (uid,))
+        refs = scalar("SELECT COUNT(*) FROM users WHERE referred_by=?", (uid,))
+        lvl, pct, nxt = vip_level(float(spent or 0))
+        s = T.banner("حسابي", "👤")
+        s += fld("🧾", "الاسم", "<b>%s</b>" % e(u["tg_name"] or u["username"]))
+        s += fld("🆔", "الآيدي", cid_tag(u))
+        if u["tg_username"]: s += fld("✈️", "تيليجرام", "@%s" % e(u["tg_username"]))
+        s += fld("📅", "انضم", "<code>%s</code>" % e((u["created_at"] or "")[:10]))
+        s += SEP + "\n"
+        s += fld("💵", "الرصيد", money(u["balance"]))
+        s += fld("📥", "إجمالي الشحن", "<code>%s</code>" % usd(dep))
+        s += fld("🛍", "إجمالي المشتريات", "<code>%s</code>" % usd(spent))
+        s += fld("📦", "الأرقام المشتراة", "<b>%d</b>" % cnt)
+        s += fld("👥", "المدعوّون", "<b>%d</b>" % refs)
+        s += SEP + "\n"
+        s += fld("🏅", "المستوى", "<b>%s</b>" % lvl)
+        s += "   <code>%s</code>\n" % bar(pct)
+        s += ("   ⬆️ المستوى التالي عند مشتريات <b>%s</b>\n" % usd(nxt)) if nxt else "   🌟 وصلت لأعلى مستوى!\n"
         return s
 
     @staticmethod
     def number_card(n, bal=None, pct=0.0, coupon=None):
         price = final_price(n["price"], pct)
         s = T.banner("تفاصيل الرقم", "📱")
-        s += "%s\n🌍 الدولة:  %s <b>%s</b>\n" % (plat_label(n["platform"]), flag_of(n["country"]), E(n["country"]))
-        s += "☎️ الرقم:  <code>%s</code>\n" % E(mask_phone(n["phone"]))
-        if n["is_premium"]: s += "💎 <b>رقم مميز</b>\n"
+        s += fld("📡", "المنصة", plat_label(n["platform"]))
+        s += fld("🌍", "الدولة", "%s <b>%s</b>" % (flag_of(n["country"]), e(n["country"])))
+        s += fld("☎️", "الرقم", "<code>%s</code>" % e(mask_phone(n["phone"])))
+        if n["is_premium"]: s += fld("💎", "النوع", "<b>رقم مميز</b>")
         st = stamps_of(n["id"])
-        if st: s += "🏅 " + " • ".join(E(x) for x in st) + "\n"
-        s += THIN + "\n"
+        if st: s += fld("🏅", "الشارات", " • ".join(e(x) for x in st))
+        s += SEP + "\n"
         if pct:
-            s += "🏷 السعر الأصلي:  <s>%s</s>\n🎟 الكوبون <code>%s</code> (−%g%%)\n" % (usd(n["price"]), E(coupon), pct)
-        s += "💳 السعر:  <b><code>%s</code></b>\n" % usd(price)
-        if bal is not None: s += "💰 رصيدك:  <code>%s</code>\n" % usd(bal)
+            s += fld("🏷", "السعر الأصلي", "<s>%s</s>" % usd(n["price"]))
+            s += fld("🎟", "الكوبون", "<code>%s</code> (−%g%%)" % (e(coupon), pct))
+        s += fld("💳", "السعر", "<b>%s</b>" % usd(price))
+        if bal is not None:
+            s += fld("💵", "رصيدك", money(bal))
+            if bal < price: s += "┃ ⚠️ ينقصك <b>%s</b>\n" % usd(price - bal)
         return s
 
     @staticmethod
     def purchased(n, paid):
         s = T.banner("تمت عملية الشراء", "✅")
-        s += "%s  %s <b>%s</b>\n" % (plat_label(n["platform"]), flag_of(n["country"]), E(n["country"]))
-        s += "☎️ الرقم (اضغط للنسخ):\n<code>%s</code>\n\n💳 المدفوع:  <code>%s</code>\n" % (E(n["phone"]), usd(paid))
+        s += fld("📡", "المنصة", plat_label(n["platform"]))
+        s += fld("🌍", "الدولة", "%s <b>%s</b>" % (flag_of(n["country"]), e(n["country"])))
+        s += fld("💳", "المدفوع", "<b>%s</b>" % usd(paid))
+        s += SEP + "\n☎️ الرقم (اضغط للنسخ):\n<code>%s</code>\n" % e(n["phone"])
         s += "\n%s\n⏳ جاري البحث عن كود التفعيل تلقائياً… سيصلك هنا فور وصوله.\n🔑 أو اضغط «سحب الكود» بعد طلبه من التطبيق." % THIN
         return s
 
     @staticmethod
     def code_card(n, code):
         s = T.banner("كود التفعيل", "🔑")
-        s += "%s  <code>%s</code>\n\n" % (plat_label(n["platform"]), E(n["phone"]))
-        s += "┌──────────────┐\n   🔐  <b><code>%s</code></b>\n└──────────────┘\n" % E(code)
+        s += fld("📡", "المنصة", plat_label(n["platform"]))
+        s += fld("☎️", "الرقم", "<code>%s</code>" % e(n["phone"]))
+        s += "\n┏━━━━━━━━━━━━━━┓\n    🔐  <b><code>%s</code></b>\n┗━━━━━━━━━━━━━━┛\n" % e(code)
         s += "\n⚠️ لا تشارك الكود مع أي شخص."
         return s
 
     @staticmethod
     def my_number(n):
         s = T.banner("رقمي", "📦")
-        s += "%s  %s <b>%s</b>\n☎️ <code>%s</code>\n" % (plat_label(n["platform"]), flag_of(n["country"]), E(n["country"]), E(n["phone"]))
-        s += "💳 دفعت:  <code>%s</code>\n🕒 الشراء:  %s\n" % (usd(n["paid_price"] if n["paid_price"] is not None else n["price"]), E(n["sold_at"]))
-        if n["last_code"]: s += "\n🔑 آخر كود:  <code>%s</code>\n" % E(n["last_code"])
+        s += fld("📡", "المنصة", plat_label(n["platform"]))
+        s += fld("🌍", "الدولة", "%s <b>%s</b>" % (flag_of(n["country"]), e(n["country"])))
+        s += fld("☎️", "الرقم", "<code>%s</code>" % e(n["phone"]))
+        s += fld("💳", "دفعت", "<b>%s</b>" % usd(n["paid_price"] if n["paid_price"] is not None else n["price"]))
+        s += fld("🕒", "الشراء", "<code>%s</code>" % e(n["sold_at"]))
+        if n["last_code"]: s += SEP + "\n" + fld("🔑", "آخر كود", "<code>%s</code>" % e(n["last_code"]))
         return s
 
     @staticmethod
     def deposit_notice(d, u, extra=""):
         s = T.banner("طلب شحن جديد", "💳")
-        s += "👤 %s  (<code>%s</code>)\n" % (E(u["tg_name"] or u["username"]), E(u["custom_id"] or u["user_id"]))
-        s += "🏦 الطريقة:  <b>%s</b>\n💵 المبلغ:  <b>%s</b>\n" % (E(d["method"]), usd(d["amount_usd"]))
-        if d["trans_id"]: s += "🧾 المرجع:  <code>%s</code>\n" % E(d["trans_id"])
-        s += "🆔 طلب رقم:  <code>%d</code>\n" % d["id"]
+        s += fld("👤", "العميل", "%s (%s)" % (e(u["tg_name"] or u["username"]), cid_tag(u)))
+        s += fld("🏦", "الطريقة", "<b>%s</b>" % e(d["method"]))
+        s += fld("💵", "المبلغ", "<b>%s</b>" % usd(d["amount_usd"]))
+        if d["trans_id"]: s += fld("🧾", "المرجع", "<code>%s</code>" % e(d["trans_id"]))
+        s += fld("🆔", "طلب رقم", "<code>%d</code>" % d["id"])
         return s + extra
 
 # ---------------- الحالات (State machine للنصوص) ----------------
@@ -1014,16 +1123,16 @@ def ctx_user(tg_user, ref=None):
 
 def banned_guard(chat_id, u):
     if u["is_banned"]:
-        send(chat_id, "🚫 <b>حسابك محظور.</b>\nللاستفسار تواصل مع الدعم: %s" % E(get_setting("SUPPORT_USER", "")))
+        send(chat_id, "🚫 <b>حسابك محظور.</b>\nللاستفسار تواصل مع الدعم: %s" % e(get_setting("SUPPORT_USER", "")))
         return True
     return False
 
 def main_kb(tg_id):
     rows_ = [
-        [B("🛒 المتجر", "shop"), B("💰 محفظتي", "wal")],
-        [B("📦 أرقامي", "my:0"), B("➕ شحن الرصيد", "dep")],
-        [B("💸 تحويل رصيد", "tr"), B("🎁 مكافأة يومية", "bonus")],
-        [B("💰 بيع رقم", "sell")],
+        [B("🛒 المتجر", "shop"), B("👤 حسابي", "prof")],
+        [B("💰 محفظتي", "wal"), B("➕ شحن الرصيد", "dep")],
+        [B("📦 أرقامي", "my:0"), B("💸 تحويل رصيد", "tr")],
+        [B("💰 بيع رقم", "sell"), B("🎁 مكافأة يومية", "bonus")],
         [B("🎧 الدعم الفني", "sup"), B("👥 الإحالات", "ref")],
         [B("🔗 ربط حساب الموقع", "lnk"), B("🔐 بيانات الموقع", "acc")],
     ]
@@ -1051,7 +1160,7 @@ def cmd_start(m):
     send(m.chat.id, T.welcome(u, new), main_kb(m.from_user.id))
     if new:
         notify_admins("👤 <b>مستخدم جديد عبر البوت</b>\n%s  <code>%s</code>\n🆔 <code>%s</code>%s" % (
-            E(u["tg_name"] or ""), E("@" + u["tg_username"] if u["tg_username"] else ""), E(u["custom_id"]),
+            e(u["tg_name"] or ""), e("@" + u["tg_username"] if u["tg_username"] else ""), e(u["custom_id"]),
             ("\n🔗 إحالة من: <code>%s</code>" % u["referred_by"]) if u["referred_by"] else ""))
 
 @bot.message_handler(commands=["menu", "help"])
@@ -1179,9 +1288,9 @@ def step_coupon(m, st):
     code = (m.text or "").strip().upper()
     pct, err = coupon_check(code, u["user_id"])
     if pct is None:
-        return send(m.chat.id, "❌ %s" % E(err), K([B("🔁 جرّب كوبون آخر", "nc:%d" % nid)], [B("◀️ رجوع للرقم", "nd:%d" % nid)]))
+        return send(m.chat.id, "❌ %s" % e(err), K([B("🔁 جرّب كوبون آخر", "nc:%d" % nid)], [B("◀️ رجوع للرقم", "nd:%d" % nid)]))
     COUPONS[(m.from_user.id, nid)] = code
-    send(m.chat.id, "✅ تم تفعيل الكوبون <code>%s</code> — خصم <b>%g%%</b>" % (E(code), pct), K([B("➡️ متابعة", "nd:%d" % nid)]))
+    send(m.chat.id, "✅ تم تفعيل الكوبون <code>%s</code> — خصم <b>%g%%</b>" % (e(code), pct), K([B("➡️ متابعة", "nd:%d" % nid)]))
 
 @cb("nb")
 def cb_buy_confirm(c, u, a):
@@ -1194,8 +1303,8 @@ def cb_buy_confirm(c, u, a):
         p, _e = coupon_check(code, u["user_id"]); pct = p or 0.0
     price = final_price(n["price"], pct)
     s = ("⚠️ <b>تأكيد الشراء</b>\n%s\n%s %s\n☎️ <code>%s</code>\n💳 سيتم خصم  <b>%s</b>  من رصيدك\n\n"
-         "هل تريد المتابعة؟") % (LINE, flag_of(n["country"]), E(n["country"]), E(mask_phone(n["phone"])), usd(price))
-    show(c, s, K([B("✅ نعم، اشترِ", "ny:%d" % nid), B("❌ إلغاء", "nd:%d" % nid)]))
+         "هل تريد المتابعة؟") % (LINE, flag_of(n["country"]), e(n["country"]), e(mask_phone(n["phone"])), usd(price))
+    show(c, s, K([B("✅ نعم، اشترِ", "ny:%d" % nid, style=BTN.SUCCESS), B("❌ إلغاء", "nd:%d" % nid, style=BTN.DANGER)]))
 
 @cb("ny")
 def cb_buy_do(c, u, a):
@@ -1203,7 +1312,7 @@ def cb_buy_do(c, u, a):
     ok, msg, n = buy_number(u["user_id"], nid, coupon)
     if not ok:
         toast(c, "❌ " + msg, True)
-        return show(c, "❌ <b>تعذّر الشراء</b>\n%s" % E(msg),
+        return show(c, "❌ <b>تعذّر الشراء</b>\n%s" % e(msg),
                     K([B("➕ شحن الرصيد", "dep")], [B("🛒 المتجر", "shop")], home_row()))
     toast(c, "✅ تم الشراء")
     COUPONS.pop((c.from_user.id, nid), None)
@@ -1211,8 +1320,8 @@ def cb_buy_do(c, u, a):
     show(c, T.purchased(n, paid), K([B("🔑 سحب الكود", "otp:%d" % nid)], [B("📦 أرقامي", "my:0"), B("🏠", "m")]))
     buyer = user_by_id(u["user_id"])
     notify_admins("🛍 <b>عملية شراء جديدة</b> (بوت)\n👤 %s  <code>%s</code>\n%s %s <code>%s</code>\n💳 %s  ·  💰 رصيده الآن %s" % (
-        E(buyer["tg_name"] or buyer["username"]), E(buyer["custom_id"]), plat_label(n["platform"]),
-        E(n["country"]), E(n["phone"]), usd(paid), usd(buyer["balance"])))
+        e(buyer["tg_name"] or buyer["username"]), e(buyer["custom_id"]), plat_label(n["platform"]),
+        e(n["country"]), e(n["phone"]), usd(paid), usd(buyer["balance"])))
     if get_setting("BOT_AUTO_OTP", "1") == "1":
         threading.Thread(target=auto_otp_worker, args=(c.message.chat.id, u["user_id"], nid), daemon=True).start()
 
@@ -1284,15 +1393,15 @@ def cb_history(c, u, a):
     toast(c); uid = u["user_id"]; ev = []
     for d in rows("SELECT * FROM deposits WHERE user_id=? ORDER BY id DESC LIMIT 8", (uid,)):
         ic = {"approved": "✅", "pending": "⏳", "rejected": "❌"}.get(d["status"], "•")
-        ev.append((d["created_at"] or "", "%s شحن %s  %s" % (ic, E(d["method"]), usd(d["amount_usd"]))))
+        ev.append((d["created_at"] or "", "%s شحن %s  %s" % (ic, e(d["method"]), usd(d["amount_usd"]))))
     for t in rows("SELECT * FROM transfers WHERE from_id=? OR to_id=? ORDER BY id DESC LIMIT 8", (uid, uid)):
         out = t["from_id"] == uid
         ev.append((t["created_at"] or "", "%s تحويل %s  %s" % ("📤" if out else "📥", "صادر" if out else "وارد", usd(t["amount"]))))
     for n in rows("SELECT * FROM numbers WHERE buyer_id=? AND status='sold' ORDER BY sold_at DESC LIMIT 8", (uid,)):
-        ev.append((n["sold_at"] or "", "🛍 شراء %s  %s" % (E(n["country"]), usd(n["paid_price"] if n["paid_price"] is not None else n["price"]))))
+        ev.append((n["sold_at"] or "", "🛍 شراء %s  %s" % (e(n["country"]), usd(n["paid_price"] if n["paid_price"] is not None else n["price"]))))
     ev.sort(key=lambda x: x[0], reverse=True)
     s = T.banner("سجل العمليات", "📜")
-    s += "\n".join("<code>%s</code>  %s" % (E(t[:16]), line) for t, line in ev[:12]) if ev else "لا توجد عمليات بعد."
+    s += "\n".join("<code>%s</code>  %s" % (e(t[:16]), line) for t, line in ev[:12]) if ev else "لا توجد عمليات بعد."
     show(c, s, K(back_row("wal")))
 
 @cb("bonus")
@@ -1311,7 +1420,7 @@ def cb_referral(c, u, a):
     link = "https://t.me/%s?start=ref_%s" % (uname, u["user_id"])
     s = T.banner("نظام الإحالة", "👥")
     s += "ادعُ أصدقاءك واربح <b>%s</b> عن كل صديق يُجري أول عملية شراء!\n\n🔗 رابطك:\n<code>%s</code>\n\n👥 عدد المدعوّين:  <b>%d</b>\n💎 أرباحك:  <b>%s</b>" % (
-        usd(fsetting("REFERRAL_REWARD", 0.001)), E(link), cnt, usd(u["referral_earnings"] or 0))
+        usd(fsetting("REFERRAL_REWARD", 0.001)), e(link), cnt, usd(u["referral_earnings"] or 0))
     show(c, s, K(home_row()))
 
 # ============================================================
@@ -1339,10 +1448,10 @@ def step_voucher(m, st):
         clear_state(m.from_user.id); u = user_by_id(u["user_id"])
         send(m.chat.id, T.banner("تم الشحن", "✅") + "💵 أُضيف  <b>%s</b>\n💰 رصيدك الآن:  <code>%s</code>" % (usd(amt), usd(u["balance"])),
              K([B("🛒 تسوّق الآن", "shop"), B("🏠", "m")]))
-        notify_admins("🎟 <b>شحن بكود</b>\n👤 %s <code>%s</code>\n💵 %s" % (E(u["tg_name"] or u["username"]), E(u["custom_id"]), usd(amt)))
+        notify_admins("🎟 <b>شحن بكود</b>\n👤 %s <code>%s</code>\n💵 %s" % (e(u["tg_name"] or u["username"]), e(u["custom_id"]), usd(amt)))
     else:
         touch_state(m.from_user.id)
-        send(m.chat.id, "❌ %s\nأرسل كوداً آخر أو اضغط إلغاء." % E(msg), K([B("✖️ إلغاء", "dep")]))
+        send(m.chat.id, "❌ %s\nأرسل كوداً آخر أو اضغط إلغاء." % e(msg), K([B("✖️ إلغاء", "dep")]))
 
 @cb("dp")
 def cb_dep_method(c, u, a):
@@ -1351,10 +1460,10 @@ def cb_dep_method(c, u, a):
     label, pre = PAY_METHODS[m_]
     acct = get_setting(pre + "_ACCOUNT" if m_ != "binance" else "BINANCE_PAY_ID", "") or "—"
     s = T.banner("الشحن عبر " + label, "💳")
-    s += "📌 أرسل المبلغ إلى:\n<code>%s</code>\n" % E(acct)
+    s += "📌 أرسل المبلغ إلى:\n<code>%s</code>\n" % e(acct)
     if m_ != "binance":
         s += "\n💱 أسعار الصرف:\n  🇾🇪 1$ = <b>%s</b> ريال يمني\n  🇸🇦 1$ = <b>%s</b> ريال سعودي\n" % (
-            E(get_setting(pre + "_RATE_YE", "—")), E(get_setting(pre + "_RATE_SA", "—")))
+            e(get_setting(pre + "_RATE_YE", "—")), e(get_setting(pre + "_RATE_SA", "—")))
     else:
         s += "\n💡 بعد الدفع أرسل <b>رقم العملية (Order ID)</b> وسنتحقق تلقائياً.\n"
     s += "\n%s\n✏️ الآن أرسل <b>المبلغ بالدولار</b> الذي حوّلته (مثال: <code>2.5</code>):" % THIN
@@ -1391,20 +1500,20 @@ def step_dep_ref(m, st):
     if meth == "binance" and file_id is None:
         ok, why = binance_auto_verify(ref, amt) if get_setting("BINANCE_API_KEY", "") else (False, "")
         did, err = create_deposit(u["user_id"], meth, amt, ref)
-        if err: return send(m.chat.id, "❌ %s" % E(err), K([B("◀️ رجوع", "dep")]))
+        if err: return send(m.chat.id, "❌ %s" % e(err), K([B("◀️ رجوع", "dep")]))
         clear_state(m.from_user.id)
         if ok:
             approve_deposit(did); BOT_MARK("dep_status", did); u2 = user_by_id(u["user_id"])
             send(m.chat.id, T.banner("تم التحقق تلقائياً", "✅") + "💵 أُضيف <b>%s</b> لرصيدك\n💰 رصيدك: <code>%s</code>" % (usd(amt), usd(u2["balance"])),
                  K([B("🛒 تسوّق", "shop"), B("🏠", "m")]))
-            return notify_admins("🟡 <b>Binance — تأكيد تلقائي</b>\n👤 %s <code>%s</code>\n💵 %s  🧾 <code>%s</code>" % (E(u["tg_name"] or u["username"]), E(u["custom_id"]), usd(amt), E(ref)))
+            return notify_admins("🟡 <b>Binance — تأكيد تلقائي</b>\n👤 %s <code>%s</code>\n💵 %s  🧾 <code>%s</code>" % (e(u["tg_name"] or u["username"]), e(u["custom_id"]), usd(amt), e(ref)))
     else:
         did, err = create_deposit(u["user_id"], meth, amt, ref, file_id)
-        if err: return send(m.chat.id, "❌ %s" % E(err), K([B("◀️ رجوع", "dep")]))
+        if err: return send(m.chat.id, "❌ %s" % e(err), K([B("◀️ رجوع", "dep")]))
         clear_state(m.from_user.id)
     send(m.chat.id, T.banner("تم استلام طلبك", "⏳") + "🆔 رقم الطلب: <code>%d</code>\n💵 %s\nسيتم إشعارك فور المراجعة ✅" % (did, usd(amt)), K(home_row()))
     d = row("SELECT * FROM deposits WHERE id=?", (did,))
-    notify_admins(T.deposit_notice(d, u), K([B("✅ موافقة", "a_da:%d" % did), B("❌ رفض", "a_dr:%d" % did)]), photo=file_id)
+    notify_admins(T.deposit_notice(d, u), K([B("✅ موافقة", "a_da:%d" % did, style=BTN.SUCCESS), B("❌ رفض", "a_dr:%d" % did, style=BTN.DANGER)]), photo=file_id)
 
 
 # ============================================================
@@ -1618,11 +1727,11 @@ def step_sell_phone(m, st):
     sess, code_hash, err = tg_sell_request_code(phone)
     if not sess:
         clear_state(m.from_user.id)
-        return send(m.chat.id, "❌ فشل إرسال الكود: %s" % E(str(err)), main_kb(m.from_user.id))
+        return send(m.chat.id, "❌ فشل إرسال الكود: %s" % e(str(err)), main_kb(m.from_user.id))
     run("INSERT OR REPLACE INTO temp_sessions(phone, session_str, code_hash, created_at) VALUES(?,?,?,?)",
         (phone, sess, code_hash, now_s()))
     set_state(m.from_user.id, "sell_code", phone=phone)
-    send(m.chat.id, "📨 تم إرسال الكود إلى تيليجرام على الرقم <code>%s</code>.\nأرسل الكود الآن:" % E(phone))
+    send(m.chat.id, "📨 تم إرسال الكود إلى تيليجرام على الرقم <code>%s</code>.\nأرسل الكود الآن:" % e(phone))
 
 
 @step("sell_code")
@@ -1637,7 +1746,7 @@ def step_sell_code(m, st):
         return send(m.chat.id, "❌ انتهت الجلسة، ابدأ من جديد من بيع رقم.", main_kb(m.from_user.id))
     sess, status, err = tg_sell_verify_code(phone, code, temp["session_str"], temp["code_hash"])
     if status == "error":
-        return send(m.chat.id, "❌ %s" % E(str(err)))
+        return send(m.chat.id, "❌ %s" % e(str(err)))
     if status == "2fa":
         set_state(m.from_user.id, "sell_pw", phone=phone, sess=sess)
         return send(m.chat.id, "🔐 الرقم عليه تحقق بخطوتين. أرسل <b>كلمة سر التحقق</b>:")
@@ -1650,7 +1759,7 @@ def step_sell_pw(m, st):
     sess = st["data"].get("sess")
     new_sess, err = tg_sell_verify_password(sess, (m.text or "").strip())
     if not new_sess:
-        return send(m.chat.id, "❌ %s" % E(str(err)))
+        return send(m.chat.id, "❌ %s" % e(str(err)))
     finish_sell(m, phone, new_sess, has_pw_check=False)
 
 
@@ -1663,7 +1772,7 @@ def finish_sell(m, phone, sess, has_pw_check):
         return send(m.chat.id, "❌ سجّل دخولك أولاً.", main_kb(uid_tg))
     ok, has_2fa, err = tg_sell_check(sess)
     if not ok:
-        return send(m.chat.id, "❌ فشل التحقق من الجلسة: %s" % E(str(err)), main_kb(uid_tg))
+        return send(m.chat.id, "❌ فشل التحقق من الجلسة: %s" % e(str(err)), main_kb(uid_tg))
     tg_sell_logout_others(sess)
     if has_pw_check and has_2fa:
         return send(m.chat.id, "⚠️ هذا الرقم عليه تحقق بخطوتين. أزله من تيليجرام أولاً ثم أعد المحاولة.",
@@ -1674,8 +1783,8 @@ def finish_sell(m, phone, sess, has_pw_check):
     nid = sell_save_pending(user["user_id"], phone, sess, new_pass)
     run("DELETE FROM temp_sessions WHERE phone=?", (phone,))
     send(m.chat.id, "✅ <b>تم استلام رقمك</b>\n\nالرقم <code>%s</code> قيد المراجعة من الإدارة، وبيظهر في حسابك بعد الموافقة."
-         % E(phone), main_kb(uid_tg))
-    notify_admins("💰 <b>طلب بيع رقم جديد</b>\n📱 <code>%s</code>\n🆔 رقم الطلب: %s" % (E(phone), nid))
+         % e(phone), main_kb(uid_tg))
+    notify_admins("💰 <b>طلب بيع رقم جديد</b>\n📱 <code>%s</code>\n🆔 رقم الطلب: %s" % (e(phone), nid))
 
 
 # ============================================================
@@ -1697,7 +1806,7 @@ def step_tr_id(m, st):
     if t["user_id"] == u["user_id"]: return send(m.chat.id, "❌ لا يمكن التحويل لنفسك.")
     if t["is_banned"]: return send(m.chat.id, "❌ هذا المستخدم محظور.")
     set_state(m.from_user.id, "tr_amt", cid=cid)
-    send(m.chat.id, "✅ المستلم: <b>%s</b> (<code>%s</code>)\n\n💵 أرسل <b>المبلغ بالدولار</b>:" % (E(t["tg_name"] or t["username"]), cid), K([B("✖️ إلغاء", "m")]))
+    send(m.chat.id, "✅ المستلم: <b>%s</b> (<code>%s</code>)\n\n💵 أرسل <b>المبلغ بالدولار</b>:" % (e(t["tg_name"] or t["username"]), cid), K([B("✖️ إلغاء", "m")]))
 
 @step("tr_amt")
 def step_tr_amt(m, st):
@@ -1709,8 +1818,8 @@ def step_tr_amt(m, st):
     net = round(amt - fee, 4) if MIRROR_SITE_TRANSFER_MATH else amt
     set_state(m.from_user.id, "tr_confirm", cid=cid, amt=amt)
     send(m.chat.id, "⚠️ <b>تأكيد التحويل</b>\n%s\n👤 إلى: <b>%s</b> (<code>%s</code>)\n💵 المبلغ: <b>%s</b>\n💳 الرسوم: <b>%s</b>\n📥 يصل للمستلم: <b>%s</b>\n💸 يُخصم منك: <b>%s</b>" % (
-        LINE, E(t["tg_name"] or t["username"]), cid, usd(amt), usd(fee), usd(net), usd(amt + fee)),
-         K([B("✅ تأكيد", "trok"), B("❌ إلغاء", "m")]))
+        LINE, e(t["tg_name"] or t["username"]), cid, usd(amt), usd(fee), usd(net), usd(amt + fee)),
+         K([B("✅ تأكيد", "trok", style=BTN.SUCCESS), B("❌ إلغاء", "m", style=BTN.DANGER)]))
 
 @cb("trok")
 def cb_transfer_ok(c, u, a):
@@ -1719,12 +1828,12 @@ def cb_transfer_ok(c, u, a):
     cid, amt = st["data"]["cid"], st["data"]["amt"]; clear_state(c.from_user.id)
     ok, msg, info = transfer_balance(u["user_id"], cid, amt)
     if not ok:
-        toast(c, "❌ " + msg, True); return show(c, "❌ <b>فشل التحويل</b>\n%s" % E(msg), K(home_row()))
+        toast(c, "❌ " + msg, True); return show(c, "❌ <b>فشل التحويل</b>\n%s" % e(msg), K(home_row()))
     toast(c, "✅ تم التحويل"); u = user_by_id(u["user_id"])
-    show(c, T.banner("تم التحويل", "✅") + "📤 أُرسل  <b>%s</b>  إلى  <code>%s</code>\n💳 الرسوم: %s\n💰 رصيدك الآن: <code>%s</code>" % (usd(info["net"]), E(cid), usd(info["fee"]), usd(u["balance"])), K(home_row()))
+    show(c, T.banner("تم التحويل", "✅") + "📤 أُرسل  <b>%s</b>  إلى  <code>%s</code>\n💳 الرسوم: %s\n💰 رصيدك الآن: <code>%s</code>" % (usd(info["net"]), e(cid), usd(info["fee"]), usd(u["balance"])), K(home_row()))
     t = info["to"]
     if t["tg_id"]:
-        send(int(t["tg_id"]), T.banner("وصلك تحويل", "📥") + "💵 استلمت  <b>%s</b>\n👤 من: <code>%s</code>" % (usd(info["net"]), E(u["custom_id"])), K(home_row()))
+        send(int(t["tg_id"]), T.banner("وصلك تحويل", "📥") + "💵 استلمت  <b>%s</b>\n👤 من: <code>%s</code>" % (usd(info["net"]), e(u["custom_id"])), K(home_row()))
 
 # ============================================================
 #  17) الدعم الفني
@@ -1735,7 +1844,7 @@ def cb_support(c, u, a):
     msgs = ticket_msgs(t["id"], 6)
     s = T.banner("الدعم الفني", "🎧") + "🎫 تذكرتك رقم <code>%d</code>\n%s\n" % (t["id"], THIN)
     for x in msgs:
-        s += "%s %s\n" % ("🧑" if x["sender"] == "user" else "🛡", E(x["text"][:300]))
+        s += "%s %s\n" % ("🧑" if x["sender"] == "user" else "🛡", e(x["text"][:300]))
     if not msgs: s += "اكتب مشكلتك وسيرد عليك الفريق قريباً 👇\n"
     s += "\n✍️ <b>أرسل رسالتك الآن</b> (يمكنك إرسال عدة رسائل)."
     set_state(c.from_user.id, "support", tid=t["id"])
@@ -1774,9 +1883,9 @@ def step_lnk_pw(m, st):
     ok, msg = link_site_account(m.from_user.id, ident, pw)
     if ok:
         u = user_by_tg(m.from_user.id)
-        send(m.chat.id, "✅ <b>%s</b>\n💰 رصيدك: <code>%s</code>  |  🆔 <code>%s</code>" % (E(msg), usd(u["balance"]), E(u["custom_id"])), K(home_row()))
+        send(m.chat.id, "✅ <b>%s</b>\n💰 رصيدك: <code>%s</code>  |  🆔 <code>%s</code>" % (e(msg), usd(u["balance"]), e(u["custom_id"])), K(home_row()))
     else:
-        send(m.chat.id, "❌ %s" % E(msg), K([B("🔁 حاول مجدداً", "lnk"), B("🏠", "m")]))
+        send(m.chat.id, "❌ %s" % e(msg), K([B("🔁 حاول مجدداً", "lnk"), B("🏠", "m")]))
 
 
 # ============================================================
@@ -1856,17 +1965,23 @@ def cb_pending_sales(c, u, a):
     lines = []
     for it in items[:15]:
         lines.append("📱 <code>%s</code> · %s · <b>%s</b> · متبقي %.0f ساعة" % (
-            E(it["phone"]), E(it["country"] or ""), usd(it["amount"]), it["hours_left"]))
+            e(it["phone"]), e(it["country"] or ""), usd(it["amount"]), it["hours_left"]))
     show(c, T.banner("مبيعاتي المعلقة", "⏳") + "\n".join(lines),
          K([B("🔙 حسابي", "acc")], home_row()))
 
+
+@cb("prof")
+def cb_profile(c, u, a):
+    toast(c); clear_state(c.from_user.id)
+    show(c, T.profile(user_by_id(u["user_id"])),
+         K([B("➕ شحن", "dep"), B("💸 تحويل", "tr")], [B("📜 سجل العمليات", "hist"), B("🔐 بيانات الموقع", "acc")], home_row()))
 
 @cb("acc")
 def cb_account(c, u, a):
     toast(c)
     s = T.banner("بيانات حسابك", "🔐")
     s += "👤 اسم المستخدم:  <code>%s</code>\n📧 الإيميل:  <code>%s</code>\n🆔 الآيدي:  <code>%s</code>\n🗝 مفتاح الاسترداد:  <code>%s</code>\n" % (
-        E(u["username"]), E(u["email"]), E(u["custom_id"]), E(u["recovery_key"]))
+        e(u["username"]), e(u["email"]), e(u["custom_id"]), e(u["recovery_key"]))
     s += "\n💡 لتسجيل الدخول للموقع بنفس الحساب عيّن كلمة مرور:"
     show(c, s, K([B("🔑 تعيين / تغيير كلمة المرور", "pw")],
                  [B("⭐ مستويات VIP", "vip"), B("⏳ مبيعاتي المعلقة", "psales")], home_row()))
@@ -1882,7 +1997,7 @@ def step_setpw(m, st):
     u, _ = ctx_user(m.from_user)
     ok, msg = set_site_password(u["user_id"], pw)
     if ok: clear_state(m.from_user.id)
-    send(m.chat.id, ("✅ " if ok else "❌ ") + E(msg) + ("\nسجّل الدخول بالموقع بـ: <code>%s</code>" % E(u["username"]) if ok else ""), K(home_row()))
+    send(m.chat.id, ("✅ " if ok else "❌ ") + e(msg) + ("\nسجّل الدخول بالموقع بـ: <code>%s</code>" % e(u["username"]) if ok else ""), K(home_row()))
 
 # ============================================================
 #  19) لوحة المدير داخل البوت
@@ -1955,7 +2070,7 @@ def step_add_numbers(m, st):
         else: errs.append("%s ← %s" % (p[0], msg))
     touch_state(m.from_user.id)
     s = "✅ تمت إضافة <b>%d</b> رقم للمتجر (يظهر فوراً في الموقع)." % ok_n
-    if errs: s += "\n\n⚠️ تعذّر:\n" + "\n".join("• " + E(x) for x in errs[:15])
+    if errs: s += "\n\n⚠️ تعذّر:\n" + "\n".join("• " + e(x) for x in errs[:15])
     send(m.chat.id, s + "\n\nأرسل أرقاماً أخرى أو اضغط رجوع.", K([B("◀️ رجوع", "a_num")], ADM_BACK))
 
 # ---------------- المخزون ----------------
@@ -1978,14 +2093,14 @@ def cb_num_admin(c, u, a):
     toast(c); nid = int(a[0]); n = row("SELECT * FROM numbers WHERE id=?", (nid,))
     if not n: return show(c, "الرقم غير موجود.", K(ADM_BACK))
     s = T.banner("رقم #%d" % nid, "📱") + "%s  %s %s\n☎️ <code>%s</code>\n💳 السعر: <b>%s</b>   الحالة: <b>%s</b>\n" % (
-        plat_label(n["platform"]), flag_of(n["country"]), E(n["country"]), E(n["phone"]), usd(n["price"]), E(n["status"]))
+        plat_label(n["platform"]), flag_of(n["country"]), e(n["country"]), e(n["phone"]), usd(n["price"]), e(n["status"]))
     if n["is_premium"]: s += "💎 مميز\n"
     st = stamps_of(nid)
-    if st: s += "🏅 " + " • ".join(E(x) for x in st) + "\n"
+    if st: s += "🏅 " + " • ".join(e(x) for x in st) + "\n"
     if n["buyer_id"]:
         b = user_by_id(n["buyer_id"])
-        s += "👤 المشتري: <code>%s</code>  ·  🕒 %s\n💵 دفع: %s\n" % (E(b["custom_id"] if b else n["buyer_id"]), E(n["sold_at"]), usd(n["paid_price"] or n["price"]))
-        if n["last_code"]: s += "🔑 آخر كود: <code>%s</code>\n" % E(n["last_code"])
+        s += "👤 المشتري: <code>%s</code>  ·  🕒 %s\n💵 دفع: %s\n" % (e(b["custom_id"] if b else n["buyer_id"]), e(n["sold_at"]), usd(n["paid_price"] or n["price"]))
+        if n["last_code"]: s += "🔑 آخر كود: <code>%s</code>\n" % e(n["last_code"])
     kb = []
     if n["status"] == "available":
         kb.append([B("💲 تعديل السعر", "a_np:%d" % nid), B("🗑 حذف", "a_nd:%d" % nid)])
@@ -2064,7 +2179,7 @@ def step_vgen(m, st):
     audit(None, "gen_vouchers", "%d x %s" % (len(codes), amt))
     body = "\n".join(codes)
     if len(codes) <= 30:
-        send(m.chat.id, T.banner("أكواد جاهزة", "✅") + "💵 قيمة الكود: <b>%s</b> × %d\n\n<code>%s</code>" % (usd(amt), len(codes), E(body)), K([B("➕ توليد المزيد", "a_vg")], ADM_BACK))
+        send(m.chat.id, T.banner("أكواد جاهزة", "✅") + "💵 قيمة الكود: <b>%s</b> × %d\n\n<code>%s</code>" % (usd(amt), len(codes), e(body)), K([B("➕ توليد المزيد", "a_vg")], ADM_BACK))
     else:
         bio = io.BytesIO(body.encode()); bio.name = "vouchers_%s_x%d.txt" % (amt, len(codes))
         bot.send_document(m.chat.id, bio, caption="✅ %d كود بقيمة %s" % (len(codes), usd(amt)))
@@ -2073,7 +2188,7 @@ def step_vgen(m, st):
 @cb("a_vl", admin=True)
 def cb_voucher_list(c, u, a):
     toast(c); rs = rows("SELECT * FROM vouchers WHERE is_used=0 ORDER BY id DESC LIMIT 20")
-    s = T.banner("أكواد غير مستخدمة", "📋") + ("\n".join("<code>%s</code>  ‹ %s ›" % (E(r["code"]), usd(r["amount"])) for r in rs) or "لا توجد.")
+    s = T.banner("أكواد غير مستخدمة", "📋") + ("\n".join("<code>%s</code>  ‹ %s ›" % (e(r["code"]), usd(r["amount"])) for r in rs) or "لا توجد.")
     show(c, s, K([B("◀️ رجوع", "a_vch")], ADM_BACK))
 
 # ---------------- الكوبونات ----------------
@@ -2085,7 +2200,7 @@ def cb_coupons(c, u, a):
     kb = []
     for x in cs:
         exp = (x["expires_at"] or "بلا انتهاء")[:10]
-        s += "• <code>%s</code>  −%g%%  ·  %d/%s  ·  %s\n" % (E(x["code"]), x["percent"], x["used_count"], x["max_uses"] or "∞", E(exp))
+        s += "• <code>%s</code>  −%g%%  ·  %d/%s  ·  %s\n" % (e(x["code"]), x["percent"], x["used_count"], x["max_uses"] or "∞", e(exp))
         kb.append([B("🗑 حذف " + x["code"], "a_cpd:" + x["code"])])
     if not cs: s += "لا توجد كوبونات."
     kb.insert(0, [B("➕ كوبون جديد", "a_cpa")]); kb.append(ADM_BACK)
@@ -2104,7 +2219,7 @@ def step_coupon_add(m, st):
         return send(m.chat.id, "❌ الصيغة: <code>CODE 20 100 30</code>")
     ok, msg = add_coupon(code, pct, mx, days)
     if ok: clear_state(m.from_user.id)
-    send(m.chat.id, ("✅ " if ok else "❌ ") + E(msg), K([B("🏷 الكوبونات", "a_cpn")], ADM_BACK))
+    send(m.chat.id, ("✅ " if ok else "❌ ") + e(msg), K([B("🏷 الكوبونات", "a_cpn")], ADM_BACK))
 
 @cb("a_cpd", admin=True)
 def cb_coupon_del(c, u, a):
@@ -2130,10 +2245,10 @@ def cb_deposit_view(c, u, a):
     if not d: return show(c, "الطلب غير موجود.", K(ADM_BACK))
     usr = user_by_id(d["user_id"]); fid = row("SELECT file_id FROM bot_receipts WHERE deposit_id=?", (did,))
     kb = []
-    if d["status"] == "pending": kb.append([B("✅ موافقة", "a_da:%d" % did), B("❌ رفض", "a_dr:%d" % did)])
+    if d["status"] == "pending": kb.append([B("✅ موافقة", "a_da:%d" % did, style=BTN.SUCCESS), B("❌ رفض", "a_dr:%d" % did, style=BTN.DANGER)])
     if fid: kb.append([B("🖼 عرض الإيصال", "a_dimg:%d" % did)])
     kb.append([B("◀️ الطلبات", "a_dep:0")])
-    show(c, T.deposit_notice(d, usr, "📌 الحالة: <b>%s</b>" % E(d["status"])), K(*kb))
+    show(c, T.deposit_notice(d, usr, "📌 الحالة: <b>%s</b>" % e(d["status"])), K(*kb))
 
 @cb("a_dimg", admin=True)
 def cb_deposit_img(c, u, a):
@@ -2152,8 +2267,8 @@ def _finish_deposit(c, did, approve):
         if approve:
             send(int(usr["tg_id"]), T.banner("تم شحن رصيدك", "✅") + "💵 أُضيف  <b>%s</b>\n💰 رصيدك الآن: <code>%s</code>\n🆔 طلب #%d" % (usd(d["amount_usd"]), usd(usr["balance"]), did), K([B("🛒 تسوّق الآن", "shop")]))
         else:
-            send(int(usr["tg_id"]), T.banner("تم رفض طلب الشحن", "❌") + "🆔 طلب #%d بقيمة %s\nللاستفسار: %s" % (did, usd(d["amount_usd"]), E(get_setting("SUPPORT_USER", ""))), K(home_row()))
-    show(c, T.deposit_notice(d, usr, "\n%s <b>%s بواسطة %s</b>" % ("✅" if approve else "❌", "تمت الموافقة" if approve else "تم الرفض", E(c.from_user.first_name))), K([B("💳 الطلبات", "a_dep:0")], ADM_BACK))
+            send(int(usr["tg_id"]), T.banner("تم رفض طلب الشحن", "❌") + "🆔 طلب #%d بقيمة %s\nللاستفسار: %s" % (did, usd(d["amount_usd"]), e(get_setting("SUPPORT_USER", ""))), K(home_row()))
+    show(c, T.deposit_notice(d, usr, "\n%s <b>%s بواسطة %s</b>" % ("✅" if approve else "❌", "تمت الموافقة" if approve else "تم الرفض", e(c.from_user.first_name))), K([B("💳 الطلبات", "a_dep:0")], ADM_BACK))
 
 @cb("a_da", admin=True)
 def cb_dep_approve(c, u, a): _finish_deposit(c, int(a[0]), True)
@@ -2178,9 +2293,9 @@ def user_card(x):
     nums = scalar("SELECT COUNT(*) FROM numbers WHERE buyer_id=? AND status='sold'", (x["user_id"],))
     dep = scalar("SELECT COALESCE(SUM(amount_usd),0) FROM deposits WHERE user_id=? AND status='approved'", (x["user_id"],))
     s = T.banner("مستخدم", "👤")
-    s += "🧾 الاسم: <b>%s</b>\n🆔 الآيدي: <code>%s</code>   🔢 ID: <code>%s</code>\n" % (E(x["tg_name"] or x["username"]), E(x["custom_id"]), x["user_id"])
-    s += "✈️ تيليجرام: %s\n📧 %s\n%s\n" % (("<code>%s</code> %s" % (x["tg_id"], E("@" + x["tg_username"] if x["tg_username"] else ""))) if x["tg_id"] else "غير مرتبط", E(x["email"]), THIN)
-    s += "💰 الرصيد: <b>%s</b>\n📥 شحن: %s   📦 مشتريات: %d\n🕒 انضم: %s\n" % (usd(x["balance"]), usd(dep), nums, E((x["created_at"] or "")[:16]))
+    s += "🧾 الاسم: <b>%s</b>\n🆔 الآيدي: <code>%s</code>   🔢 ID: <code>%s</code>\n" % (e(x["tg_name"] or x["username"]), e(x["custom_id"]), x["user_id"])
+    s += "✈️ تيليجرام: %s\n📧 %s\n%s\n" % (("<code>%s</code> %s" % (x["tg_id"], e("@" + x["tg_username"] if x["tg_username"] else ""))) if x["tg_id"] else "غير مرتبط", e(x["email"]), THIN)
+    s += "💰 الرصيد: <b>%s</b>\n📥 شحن: %s   📦 مشتريات: %d\n🕒 انضم: %s\n" % (usd(x["balance"]), usd(dep), nums, e((x["created_at"] or "")[:16]))
     s += "%s %s" % ("🚫" if x["is_banned"] else "🟢", "<b>محظور</b>" if x["is_banned"] else "نشط")
     if x["is_admin"]: s += "  ·  👑 مدير"
     return s
@@ -2230,7 +2345,7 @@ def step_ban(m, st):
     if x["is_admin"] and val: return send(m.chat.id, "❌ لا يمكن حظر مدير.")
     run("UPDATE users SET is_banned=? WHERE user_id=?", (val, x["user_id"])); clear_state(m.from_user.id)
     if x["tg_id"]: send(int(x["tg_id"]), "🚫 <b>تم حظر حسابك.</b>" if val else "✅ <b>تم فك الحظر عن حسابك.</b>")
-    send(m.chat.id, "%s <b>%s</b> (<code>%s</code>)" % ("🚫 تم حظر" if val else "♻️ تم فك الحظر عن", E(x["username"]), E(x["custom_id"])), K([B("👥 المستخدمون", "a_usr")]))
+    send(m.chat.id, "%s <b>%s</b> (<code>%s</code>)" % ("🚫 تم حظر" if val else "♻️ تم فك الحظر عن", e(x["username"]), e(x["custom_id"])), K([B("👥 المستخدمون", "a_usr")]))
 
 @cb("a_ubal", admin=True)
 def cb_user_bal(c, u, a):
@@ -2259,7 +2374,7 @@ def cb_user_msg(c, u, a):
 def step_user_msg(m, st):
     x = user_by_id(st["data"]["uid"]); clear_state(m.from_user.id)
     if not x or not x["tg_id"]: return send(m.chat.id, "❌ المستخدم غير مرتبط بتيليجرام.")
-    r = send(int(x["tg_id"]), T.banner("رسالة من الإدارة", "📨") + E(m.text or ""), K(home_row()))
+    r = send(int(x["tg_id"]), T.banner("رسالة من الإدارة", "📨") + e(m.text or ""), K(home_row()))
     send(m.chat.id, "✅ تم الإرسال." if r else "❌ تعذّر الإرسال (ربما حظر البوت).", K([B("◀️ المستخدم", "a_uv:%d" % x["user_id"])]))
 
 def _user_list(c, title, where, prefix, page):
@@ -2293,8 +2408,8 @@ def cb_ticket_view(c, u, a):
     toast(c); tid = int(a[0]); t = row("SELECT * FROM tickets WHERE id=?", (tid,))
     if not t: return show(c, "التذكرة غير موجودة.", K(ADM_BACK))
     usr = user_by_id(t["user_id"]); run("UPDATE ticket_messages SET is_read=1 WHERE ticket_id=? AND sender='user'", (tid,))
-    s = T.banner("تذكرة #%d" % tid, "🎫") + "👤 %s (<code>%s</code>)  ·  %s\n%s\n" % (E(usr["tg_name"] or usr["username"]), E(usr["custom_id"]), "🟢 مفتوحة" if t["status"] == "open" else "⚫ مغلقة", THIN)
-    for x in ticket_msgs(tid, 10): s += "%s %s\n" % ("🧑" if x["sender"] == "user" else "🛡", E(x["text"][:400]))
+    s = T.banner("تذكرة #%d" % tid, "🎫") + "👤 %s (<code>%s</code>)  ·  %s\n%s\n" % (e(usr["tg_name"] or usr["username"]), e(usr["custom_id"]), "🟢 مفتوحة" if t["status"] == "open" else "⚫ مغلقة", THIN)
+    for x in ticket_msgs(tid, 10): s += "%s %s\n" % ("🧑" if x["sender"] == "user" else "🛡", e(x["text"][:400]))
     kb = [[B("✍️ رد", "a_tr:%d" % tid)]]
     kb.append([B("🔒 إغلاق التذكرة", "a_tc:%d" % tid)] if t["status"] == "open" else [B("🔓 إعادة فتح", "a_to:%d" % tid)])
     kb.append([B("◀️ التذاكر", "a_tk:0")]); show(c, s, K(*kb))
@@ -2311,7 +2426,7 @@ def step_ticket_reply(m, st):
     mid = add_ticket_msg(tid, "admin", text); BOT_MARK("tadm", mid); clear_state(m.from_user.id)
     usr = user_by_id(t["user_id"])
     if usr and usr["tg_id"]:
-        send(int(usr["tg_id"]), T.banner("رد من الدعم", "🛡") + E(text) + "\n\n<i>للرد: افتح «الدعم الفني» من القائمة.</i>", K([B("🎧 الدعم الفني", "sup")]))
+        send(int(usr["tg_id"]), T.banner("رد من الدعم", "🛡") + e(text) + "\n\n<i>للرد: افتح «الدعم الفني» من القائمة.</i>", K([B("🎧 الدعم الفني", "sup")]))
     send(m.chat.id, "✅ تم إرسال الرد.", K([B("◀️ التذكرة", "a_tv:%d" % tid), B("🎫 التذاكر", "a_tk:0")]))
 
 @cb("a_tc", admin=True)
@@ -2329,7 +2444,7 @@ def cb_ticket_open(c, u, a):
 @cb("a_ann", admin=True)
 def cb_announcements(c, u, a):
     toast(c); clear_state(c.from_user.id); rs = rows("SELECT * FROM announcements ORDER BY id DESC LIMIT 10")
-    s = T.banner("الإعلانات", "📢") + ("\n".join("%s <b>#%d</b> %s" % ("🟢" if r["is_active"] else "⚫", r["id"], E(r["text"][:60])) for r in rs) or "لا توجد إعلانات.")
+    s = T.banner("الإعلانات", "📢") + ("\n".join("%s <b>#%d</b> %s" % ("🟢" if r["is_active"] else "⚫", r["id"], e(r["text"][:60])) for r in rs) or "لا توجد إعلانات.")
     kb = [[B("➕ إعلان جديد", "a_ana")]]
     for r in rs: kb.append([B(("⏸ إيقاف #%d" if r["is_active"] else "▶️ تفعيل #%d") % r["id"], "a_ant:%d" % r["id"]), B("🗑 #%d" % r["id"], "a_and:%d" % r["id"])])
     kb.append(ADM_BACK); show(c, s, K(*kb))
@@ -2363,7 +2478,7 @@ def cb_ann_level(c, u, a):
 def cb_stamps(c, u, a):
     toast(c); clear_state(c.from_user.id)
     rs = rows("SELECT s.*, (SELECT COUNT(*) FROM number_stamps WHERE stamp_id=s.id) cnt FROM stamps s ORDER BY id")
-    s = T.banner("الشارات (Stamps)", "🏅") + ("\n".join("🏅 <b>%s</b>  <code>%s</code>  %s  ·  %d رقم" % (E(r["name"]), E(r["color"]), E(r["shape"]), r["cnt"]) for r in rs) or "لا توجد شارات.")
+    s = T.banner("الشارات (Stamps)", "🏅") + ("\n".join("🏅 <b>%s</b>  <code>%s</code>  %s  ·  %d رقم" % (e(r["name"]), e(r["color"]), e(r["shape"]), r["cnt"]) for r in rs) or "لا توجد شارات.")
     kb = [[B("➕ شارة جديدة", "a_sta")]] + [[B("🗑 حذف " + r["name"], "a_std:%d" % r["id"])] for r in rs] + [ADM_BACK]
     show(c, s, K(*kb))
 
@@ -2381,7 +2496,7 @@ def step_stamp(m, st):
     name = " ".join(x for x in p if x != color and x != shape)[:30]
     try:
         run("INSERT INTO stamps(name,color,shape) VALUES(?,?,?)", (name, color, shape)); clear_state(m.from_user.id)
-        send(m.chat.id, "✅ تمت إضافة الشارة <b>%s</b>" % E(name), K([B("🏅 الشارات", "a_stp")]))
+        send(m.chat.id, "✅ تمت إضافة الشارة <b>%s</b>" % e(name), K([B("🏅 الشارات", "a_stp")]))
     except sqlite3.IntegrityError:
         send(m.chat.id, "❌ الشارة موجودة مسبقاً.")
 
@@ -2404,14 +2519,14 @@ def cb_setting_group(c, u, a):
     s = T.banner(title, "⚙️"); kb = []
     for k, lbl, sec in items:
         val = get_setting(k, "")
-        s += "• <b>%s</b>\n  <code>%s</code>\n" % (E(lbl), E(mask_secret(val) if sec else (val or "— غير مضبوط —")))
+        s += "• <b>%s</b>\n  <code>%s</code>\n" % (e(lbl), e(mask_secret(val) if sec else (val or "— غير مضبوط —")))
         kb.append([B("✏️ " + lbl, "a_sk:%d" % ALL_SETTING_KEYS.index((k, lbl, sec)))])
     kb.append([B("◀️ رجوع", "a_set")]); show(c, s, K(*kb))
 
 @cb("a_sk", admin=True)
 def cb_setting_edit(c, u, a):
     toast(c); k, lbl, sec = ALL_SETTING_KEYS[int(a[0])]; set_state(c.from_user.id, "a_setval", key=k, sec=sec, lbl=lbl)
-    ask(c.message.chat.id, "✏️ أرسل القيمة الجديدة لـ <b>%s</b>%s\n(أرسل <code>-</code> لمسح القيمة)" % (E(lbl), "\n🔒 ستُحذف رسالتك فوراً." if sec else ""), "a_set")
+    ask(c.message.chat.id, "✏️ أرسل القيمة الجديدة لـ <b>%s</b>%s\n(أرسل <code>-</code> لمسح القيمة)" % (e(lbl), "\n🔒 ستُحذف رسالتك فوراً." if sec else ""), "a_set")
 
 @step("a_setval")
 def step_setval(m, st):
@@ -2423,12 +2538,12 @@ def step_setval(m, st):
         try: float(v)
         except ValueError: return send(m.chat.id, "❌ أرسل رقماً.")
     set_setting(k, v); clear_state(m.from_user.id); audit(m.from_user.id, "set_setting", k)
-    send(m.chat.id, "✅ تم تحديث <b>%s</b>\n<code>%s</code>" % (E(lbl), E(mask_secret(v) if sec else (v or "— فارغ —"))), K([B("⚙️ الإعدادات", "a_set")], ADM_BACK))
+    send(m.chat.id, "✅ تم تحديث <b>%s</b>\n<code>%s</code>" % (e(lbl), e(mask_secret(v) if sec else (v or "— فارغ —"))), K([B("⚙️ الإعدادات", "a_set")], ADM_BACK))
 
 @cb("a_sadm", admin=True)
 def cb_extra_admins(c, u, a):
     toast(c); cur = get_setting("BOT_ADMIN_IDS", "") or "—"; set_state(c.from_user.id, "a_admins")
-    ask(c.message.chat.id, "👑 المدراء الحاليون (بالبيئة + الموقع + هنا):\n<code>%s</code>\n\nأرسل قائمة جديدة لآيدي تيليجرام مفصولة بمسافة (أو <code>-</code> للمسح).\n<i>مدراء الموقع المرتبطون بالبوت يُضافون تلقائياً.</i>" % E(", ".join(map(str, sorted(admin_ids()))) + "\n(مخصص: " + cur + ")"), "a_set")
+    ask(c.message.chat.id, "👑 المدراء الحاليون (بالبيئة + الموقع + هنا):\n<code>%s</code>\n\nأرسل قائمة جديدة لآيدي تيليجرام مفصولة بمسافة (أو <code>-</code> للمسح).\n<i>مدراء الموقع المرتبطون بالبوت يُضافون تلقائياً.</i>" % e(", ".join(map(str, sorted(admin_ids()))) + "\n(مخصص: " + cur + ")"), "a_set")
 
 @step("a_admins")
 def step_admins(m, st):
@@ -2486,20 +2601,20 @@ def cb_tool_action(c, u, a):
         try:
             with open(BOT_LOG, "r", encoding="utf-8", errors="ignore") as f: tail = "".join(f.readlines()[-35:])
         except Exception: tail = "لا يوجد سجل."
-        return show(c, T.banner("آخر السجلات", "📄") + "<pre>%s</pre>" % E(tail[-3200:]), K([B("🔄 تحديث", "a_tl:log")], [B("◀️ الأدوات", "a_tools")]))
+        return show(c, T.banner("آخر السجلات", "📄") + "<pre>%s</pre>" % e(tail[-3200:]), K([B("🔄 تحديث", "a_tl:log")], [B("◀️ الأدوات", "a_tools")]))
     if act == "health":
         toast(c); sz = os.path.getsize(DB_PATH) / 1048576 if os.path.exists(DB_PATH) else 0
         imap_ok = bool((get_setting("EMAIL_ADDRESS", "") or get_setting("WA_EMAIL_ADDRESS", "")) and (get_setting("EMAIL_PASSWORD", "") or get_setting("WA_EMAIL_PASSWORD", "")))
         try: import telethon; tl = telethon.__version__
         except Exception: tl = "غير مثبتة"
         s = T.banner("حالة النظام", "🩺") + "🗄 قاعدة البيانات: <code>%s</code> (%.2f MB)\n🧵 خيوط نشطة: %d\n🤖 سحب الأكواد التلقائي: %s\n📧 إعداد البريد: %s\n🔑 Binance: %s\n✈️ telethon: <code>%s</code>\n🔁 فحص أحداث الموقع: كل %d ثانية\n🕒 %s" % (
-            E(os.path.basename(DB_PATH)), sz, threading.active_count(), "🟢" if get_setting("BOT_AUTO_OTP", "1") == "1" else "🔴", "✅" if imap_ok else "❌ غير مضبوط",
+            e(os.path.basename(DB_PATH)), sz, threading.active_count(), "🟢" if get_setting("BOT_AUTO_OTP", "1") == "1" else "🔴", "✅" if imap_ok else "❌ غير مضبوط",
             "✅" if get_setting("BINANCE_API_KEY", "") else "❌ غير مضبوط", tl, POLL_INTERVAL, now_s())
         return show(c, s, K([B("🔄 تحديث", "a_tl:health")], [B("◀️ الأدوات", "a_tools")]))
     toast(c, "⏳ جاري الفحص…")
     ok, msg = {"bn": binance_check, "imap": _check_imap, "tg": _check_tg}[act]()
     title = {"bn": "فحص Binance", "imap": "فحص البريد", "tg": "فحص Telegram API"}[act]
-    show(c, T.banner(title, "✅" if ok else "❌") + E(msg), K([B("🔁 إعادة الفحص", "a_tl:" + act)], [B("◀️ الأدوات", "a_tools")]))
+    show(c, T.banner(title, "✅" if ok else "❌") + e(msg), K([B("🔁 إعادة الفحص", "a_tl:" + act)], [B("◀️ الأدوات", "a_tools")]))
 
 def restart_bot():
     time.sleep(1.5)
@@ -2548,7 +2663,7 @@ def cb_backup(c, u, a):
         data = db_backup_bytes(); bio = io.BytesIO(data); bio.name = "matari_backup_%s.db" % datetime.now().strftime("%Y%m%d_%H%M")
         bot.send_document(c.message.chat.id, bio, caption="💾 نسخة احتياطية متسقة من matari.db\n📦 %.2f MB" % (len(data) / 1048576))
     except Exception as ex:
-        send(c.message.chat.id, "❌ فشل النسخ: %s" % E(str(ex)[:150]))
+        send(c.message.chat.id, "❌ فشل النسخ: %s" % e(str(ex)[:150]))
 
 # ============================================================
 #  20) موجّه الرسائل النصية (الحالات)
@@ -2605,8 +2720,8 @@ def poll_once():
                   "ORDER BY n.id LIMIT 30"):
         mark("sale", n["id"])
         notify_admins("🛍 <b>عملية شراء جديدة</b> (الموقع)\n👤 %s  <code>%s</code>\n%s %s <code>%s</code>\n💳 %s" % (
-            E(n["tg_name"] or n["username"] or n["buyer_id"]), E(n["custom_id"] or ""), plat_label(n["platform"]), E(n["country"]),
-            E(n["phone"]), usd(n["paid_price"] if n["paid_price"] is not None else n["price"])))
+            e(n["tg_name"] or n["username"] or n["buyer_id"]), e(n["custom_id"] or ""), plat_label(n["platform"]), e(n["country"]),
+            e(n["phone"]), usd(n["paid_price"] if n["paid_price"] is not None else n["price"])))
     # 2) طلبات/عمليات شحن جديدة
     for d in rows("SELECT d.* FROM deposits d LEFT JOIN bot_notified b ON b.kind='dep_new' AND b.ref=CAST(d.id AS TEXT) "
                   "WHERE b.ref IS NULL ORDER BY d.id LIMIT 30"):
@@ -2615,7 +2730,7 @@ def poll_once():
         if d["status"] == "pending":
             notify_admins(T.deposit_notice(d, usr, "🌐 <i>من الموقع</i>"), K([B("✅ موافقة", "a_da:%d" % d["id"]), B("❌ رفض", "a_dr:%d" % d["id"])]))
         else:
-            notify_admins("💳 <b>شحن جديد</b> (الموقع)\n👤 %s <code>%s</code>\n🏦 %s  ·  %s" % (E(usr["username"]), E(usr["custom_id"]), E(d["method"]), usd(d["amount_usd"])))
+            notify_admins("💳 <b>شحن جديد</b> (الموقع)\n👤 %s <code>%s</code>\n🏦 %s  ·  %s" % (e(usr["username"]), e(usr["custom_id"]), e(d["method"]), usd(d["amount_usd"])))
     # 3) تغيّر حالة الشحن (موافقة/رفض من لوحة الموقع) → إشعار المستخدم
     for d in rows("SELECT d.* FROM deposits d LEFT JOIN bot_notified b ON b.kind='dep_status' AND b.ref=CAST(d.id AS TEXT) "
                   "WHERE d.status IN ('approved','rejected') AND b.ref IS NULL ORDER BY d.id LIMIT 30"):
@@ -2624,12 +2739,12 @@ def poll_once():
             if d["status"] == "approved":
                 send(int(usr["tg_id"]), T.banner("تم شحن رصيدك", "✅") + "💵 أُضيف  <b>%s</b>\n💰 رصيدك الآن: <code>%s</code>" % (usd(d["amount_usd"]), usd(usr["balance"])), K([B("🛒 تسوّق الآن", "shop")]))
             else:
-                send(int(usr["tg_id"]), T.banner("تم رفض طلب الشحن", "❌") + "🆔 طلب #%d بقيمة %s\nللاستفسار: %s" % (d["id"], usd(d["amount_usd"]), E(get_setting("SUPPORT_USER", ""))))
+                send(int(usr["tg_id"]), T.banner("تم رفض طلب الشحن", "❌") + "🆔 طلب #%d بقيمة %s\nللاستفسار: %s" % (d["id"], usd(d["amount_usd"]), e(get_setting("SUPPORT_USER", ""))))
     # 4) شحن بالأكواد من الموقع
     for v in rows("SELECT v.* FROM vouchers v LEFT JOIN bot_notified b ON b.kind='vch' AND b.ref=CAST(v.id AS TEXT) "
                   "WHERE v.is_used=1 AND b.ref IS NULL ORDER BY v.id LIMIT 30"):
         mark("vch", v["id"]); usr = user_by_id(v["used_by"]) if v["used_by"] else None
-        notify_admins("🎟 <b>شحن بكود</b> (الموقع)\n👤 %s <code>%s</code>\n💵 %s" % (E(usr["username"] if usr else "?"), E(usr["custom_id"] if usr else ""), usd(v["amount"])))
+        notify_admins("🎟 <b>شحن بكود</b> (الموقع)\n👤 %s <code>%s</code>\n💵 %s" % (e(usr["username"] if usr else "?"), e(usr["custom_id"] if usr else ""), usd(v["amount"])))
         if usr and usr["tg_id"]:
             send(int(usr["tg_id"]), T.banner("تم الشحن", "✅") + "💵 أُضيف  <b>%s</b>\n💰 رصيدك: <code>%s</code>" % (usd(v["amount"]), usd(usr["balance"])))
     # 5) رسائل التذاكر: المستخدم → المدير
@@ -2638,19 +2753,19 @@ def poll_once():
         mark("tmsg", mm["id"]); usr = user_by_id(mm["user_id"])
         first = scalar("SELECT COUNT(*) FROM ticket_messages WHERE ticket_id=? AND id<?", (mm["ticket_id"], mm["id"])) == 0
         notify_admins("%s <b>%s</b> #%d\n👤 %s <code>%s</code>\n💬 %s" % ("🎫" if first else "💬", "تذكرة دعم جديدة" if first else "رسالة دعم جديدة", mm["ticket_id"],
-                      E(usr["tg_name"] or usr["username"]) if usr else "?", E(usr["custom_id"]) if usr else "", E(mm["text"][:500])),
+                      e(usr["tg_name"] or usr["username"]) if usr else "?", e(usr["custom_id"]) if usr else "", e(mm["text"][:500])),
                       K([B("✍️ رد", "a_tr:%d" % mm["ticket_id"]), B("📖 فتح", "a_tv:%d" % mm["ticket_id"])]))
     # 6) ردود الإدارة (من لوحة الموقع) → المستخدم
     for mm in rows("SELECT m.*, t.user_id FROM ticket_messages m JOIN tickets t ON t.id=m.ticket_id "
                    "LEFT JOIN bot_notified b ON b.kind='tadm' AND b.ref=CAST(m.id AS TEXT) WHERE m.sender!='user' AND b.ref IS NULL ORDER BY m.id LIMIT 30"):
         mark("tadm", mm["id"]); usr = user_by_id(mm["user_id"])
         if usr and usr["tg_id"]:
-            send(int(usr["tg_id"]), T.banner("رد من الدعم", "🛡") + E(mm["text"]) + "\n\n<i>للرد: افتح «الدعم الفني» من القائمة.</i>", K([B("🎧 الدعم الفني", "sup")]))
+            send(int(usr["tg_id"]), T.banner("رد من الدعم", "🛡") + e(mm["text"]) + "\n\n<i>للرد: افتح «الدعم الفني» من القائمة.</i>", K([B("🎧 الدعم الفني", "sup")]))
     # 7) مستخدمون جدد من الموقع
     for x in rows("SELECT u.* FROM users u LEFT JOIN bot_notified b ON b.kind='user' AND b.ref=CAST(u.user_id AS TEXT) WHERE b.ref IS NULL LIMIT 30"):
         mark("user", x["user_id"])
         if not x["tg_id"]:
-            notify_admins("👤 <b>مستخدم جديد</b> (الموقع)\n%s  ·  <code>%s</code>" % (E(x["username"]), E(x["email"])))
+            notify_admins("👤 <b>مستخدم جديد</b> (الموقع)\n%s  ·  <code>%s</code>" % (e(x["username"]), e(x["email"])))
     # 8) طابور إشعارات داخلية (إحالات…)
     while NOTIFY_QUEUE:
         tg, kind, payload = NOTIFY_QUEUE.pop(0)
@@ -2683,8 +2798,22 @@ def _single_instance():
     except OSError:
         print("⚠️ البوت يعمل بالفعل في عملية أخرى. أوقفه أولاً (pkill -f bot.py)."); sys.exit(1)
 
+def _start_health_server():
+    """اختياري لـ Render (Web Service): BOT_HEALTH_SERVER=1 يفتح منفذ PORT لفحص الصحة. لا تفعّله لو web.py يعمل في نفس الخدمة."""
+    if os.environ.get("BOT_HEALTH_SERVER", "0") != "1": return
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200); self.send_header("Content-Type", "text/plain; charset=utf-8"); self.end_headers()
+            self.wfile.write(b"matari bot OK")
+        def log_message(self, *a): pass
+    srv = HTTPServer(("0.0.0.0", int(os.environ.get("PORT", "10000"))), H)
+    threading.Thread(target=srv.serve_forever, daemon=True, name="health").start()
+    logger.info("health server on port %s", os.environ.get("PORT", "10000"))
+
 def main():
-    lock = _single_instance()
+    lock = _start_lock = _single_instance()
+    _start_health_server()
     ensure_schema()
     token = ENV_TOKEN or (get_setting("BOT_TOKEN", "") or "").strip()
     if not token:
