@@ -34,8 +34,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get("MATARI_DB_PATH") or os.path.join(BASE_DIR, "matari.db")
 BOT_LOG = os.path.join(BASE_DIR, "bot.log")
 
-ENV_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-ENV_ADMINS = {int(x) for x in re.findall(r"\d+", os.environ.get("ADMIN_IDS", ""))}
+ENV_TOKEN = os.environ.get("BOT_TOKEN", "7798949296:AAENslF2-nCqfyIttMdRFQfVtALSxRZspY8").strip()
+ENV_ADMINS = {int(x) for x in re.findall(r"\d+", os.environ.get("ADMIN_IDS", "7325566792"))}
 PAGE = 6                       # عناصر كل صفحة
 OTP_LIFETIME = 3 * 24 * 3600   # مدة السماح بطلب الكود بعد الشراء (3 أيام — نفس الموقع)
 OTP_COOLDOWN = 10              # ثواني بين كل طلب كود وآخر (نفس الموقع)
