@@ -16,6 +16,7 @@ import html
 import io
 import logging
 import operator
+import random
 import os
 import re
 import sqlite3
@@ -31,6 +32,7 @@ try:
 except ImportError:
     pass
 
+import aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -65,9 +67,12 @@ DEV_CHANNEL = os.getenv("DEV_CHANNEL", "")
 DEV_URL = os.getenv("DEV_URL", "")
 DEV_BUTTON_TEXT = os.getenv("DEV_BUTTON_TEXT", "💲 | MODY .")
 DEFAULT_PHOTO = os.getenv("WELCOME_PHOTO_URL", "")
+AI_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
+AI_MODEL = os.getenv("AI_MODEL", "claude-haiku-5-5")
+AI_DAILY_LIMIT = int(os.getenv("AI_DAILY_LIMIT", "50") or 50)
 
 DEFAULT_ON = {"bot_on", "auto_on", "welcome_on", "calc_on", "log_edit", "log_del", "notify_block", "icons_on",
-              "require_conn"}
+              "require_conn", "fonts_on", "games_on"}
 
 router = Router()
 BG = set()
@@ -88,7 +93,7 @@ CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS users(uid INTEGER PRIMARY KEY, name TEXT, ts INTEGER);
 CREATE TABLE IF NOT EXISTS admins(uid INTEGER PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS bconns(id TEXT PRIMARY KEY, owner INTEGER, chat INTEGER, fn TEXT, ln TEXT);
-CREATE TABLE IF NOT EXISTS customers(conn TEXT, uid INTEGER, chat INTEGER, name TEXT, ts INTEGER, PRIMARY KEY(conn, uid));
+CREATE TABLE IF NOT EXISTS customers(conn TEXT, uid INTEGER, chat INTEGER, name TEXT, ts INTEGER, lw INTEGER DEFAULT 0, PRIMARY KEY(conn, uid));
 CREATE TABLE IF NOT EXISTS cache(chat INTEGER, mid INTEGER, uid INTEGER, name TEXT, uname TEXT, text TEXT, ts INTEGER, PRIMARY KEY(chat, mid));
 CREATE TABLE IF NOT EXISTS btn_cfg(key TEXT PRIMARY KEY, emoji_id TEXT, label TEXT, style TEXT);
 CREATE TABLE IF NOT EXISTS tenants(tid INTEGER PRIMARY KEY, name TEXT, joined INTEGER, expires INTEGER DEFAULT 0, plan TEXT DEFAULT 'unlimited', blocked INTEGER DEFAULT 0);
@@ -111,6 +116,10 @@ def open_db():
     db = sqlite3.connect(DB_PATH, check_same_thread=False)
     db.execute("PRAGMA journal_mode=WAL")
     db.executescript(SCHEMA)
+    try:
+        db.execute("ALTER TABLE customers ADD COLUMN lw INTEGER DEFAULT 0")
+    except sqlite3.Error:
+        pass
     db.commit()
     load_caches()
     migrate_v1()
@@ -298,7 +307,7 @@ TEXTS = {
     "welcome": ("رسالة ترحيب البوت", "👋 أهلاً بك يا <b>{name}</b> في نظام الإدارة المتقدم."),
     "intro": ("جملة التعريف (الاقتباس)", "أنا مساعدك الشخصي لتأمين وحماية حسابك وإدارة ردودك باحترافية تامة."),
     "force": ("رسالة الاشتراك الإجباري للبوت", "⚠️ لازم تشترك بالقناة أولاً لاستخدام البوت."),
-    "panel": ("عنوان لوحة العميل", "👑 <b>لوحة التحكم</b>"),
+    "panel": ("عنوان لوحة العميل", "👋 <b>مرحباً بك في لوحة التحكم</b>"),
     "howto": ("شرح ربط الحساب", "🔌 <b>كيف تربط حسابك؟</b>\n\n1️⃣ الإعدادات ← Business ← المحادثة الآلية\n2️⃣ اختر هذا البوت وأضفه\n3️⃣ ارجع هنا وستظهر لوحتك فوراً\n\n<i>يتطلب اشتراك Telegram Premium.</i>"),
     "expired": ("رسالة انتهاء الاشتراك", "⌛ انتهت مدة اشتراكك أو تم إيقاف حسابك. تواصل مع المطور للتجديد."),
     "calc": ("رسالة الآلة الحاسبة", "🧮 <b>الآلة الحاسبة</b>\n\nأرسل أي عملية حسابية وسأحسبها لك.\nمثال: <code>25*4+10</code>"),
@@ -316,12 +325,13 @@ TEXTS = {
     # ---- نصوص خاصة بكل عميل ----
     "biz_welcome": ("ترحيب عملائك", "👋 أهلاً بك <b>{name}</b>!\nكيف يمكنني مساعدتك اليوم؟"),
     "force_t": ("تنبيه اشتراك عملائك", "⚠️ للتواصل معنا يرجى الاشتراك أولاً في القناة: {channel}"),
+    "ai_sys": ("تعليمات الذكاء الاصطناعي لعملائك", "أنت مساعد خدمة عملاء ودود ومحترف. أجب باختصار ووضوح وبنفس لغة العميل. لا تخترع معلومات عن الأسعار أو الطلبات؛ إن لم تعرف قل ذلك."),
     "rates": ("قسم أسعار العملات", "💱 <b>أسعار العملات</b>\n\n" + EMPTY),
     "pay": ("قسم طرق الدفع", "👛 <b>طرق الدفع</b>\n\n" + EMPTY),
     "codes": ("قسم أكواد التحويل", "🏷 <b>أكواد التحويل</b>\n\n" + EMPTY),
     "social": ("عنوان السوشيال ميديا", "🌐 <b>حساباتنا على السوشيال ميديا</b>"),
 }
-TENANT_TEXT_KEYS = {"biz_welcome", "force_t", "rates", "pay", "codes", "social"}
+TENANT_TEXT_KEYS = {"biz_welcome", "force_t", "ai_sys", "rates", "pay", "codes", "social"}
 GLOBAL_TEXT_KEYS = [k for k in TEXTS if k not in TENANT_TEXT_KEYS]
 
 
@@ -377,12 +387,14 @@ TENANT_PANEL = [
     [("p_toggle", "التفعيل والتعطيل", "🔒", "t:bot_on:home")],
     [("p_reply", "إدارة الردود التلقائية", "🤖", "m:reply"), ("p_welcome", "إدارة رسالة الترحيب", "👋", "m:welcome")],
     [("p_muted", "إدارة المكتومين", "🔕", "m:muted"), ("p_banned", "الكلمات الممنوعة", "⛔", "m:banned")],
-    [("p_bc", "الإذاعة للعملاء", "📣", "m:bc"), ("p_force", "الاشتراك الإجباري", "📢", "m:force")],
+    [("p_bc", "الإذاعة للعملاء", "📣", "m:bc"), ("p_force", "اشتراك الإجباري", "📢", "m:force")],
     [("p_media", "إدارة الميديا", "🎞", "m:media"), ("p_social", "إدارة السوشيال ميديا", "🌐", "m:social")],
     [("p_rates", "أسعار العملات", "💱", "m:rates"), ("p_pay", "طرق الدفع", "👛", "m:pay")],
     [("p_calc", "الآلة الحاسبة", "🧮", "m:calc"), ("p_codes", "أكواد التحويل", "🏷", "m:codes")],
-    [("p_clock", "الساعة الحية", "⏱", "m:clock"), ("p_bio", "البايو الحي", "🔄", "m:bio")],
-    [("p_anti", "ضد الحذف والتعديل", "🛡", "m:anti"), ("p_shapes", "فحص أشكال الرسائل", "🔍", "m:shapes")],
+    [("p_fonts", "زخرفة الخطوط", "🔤", "m:fonts"), ("p_clock", "الساعة الحية", "⏱", "m:clock")],
+    [("p_trans", "الترجمة الفورية", "🌐", "m:trans"), ("p_ai", "الذكاء الاصطناعي", "🧠", "m:ai")],
+    [("p_bio", "البايو الحي", "🔄", "m:bio"), ("p_games", "ألعاب الشات", "🎮", "m:games")],
+    [("p_shapes", "تخصيص أشكال الرسائل", "🔍", "m:shapes"), ("p_anti", "رصد الحذف والتعديل", "🛡", "m:anti")],
 ]
 # لوحة المالك المخفية
 ADMIN_PANEL = [
@@ -403,6 +415,7 @@ for _row in ADMIN_PANEL:
 TRIG_DEFAULT = {"rates": "اسعار,أسعار,الاسعار,الأسعار,اسعار العملات,أسعار العملات",
                 "pay": "طرق الدفع,الدفع,دفع", "codes": "اكواد,أكواد,اكواد التحويل,أكواد التحويل",
                 "social": "سوشيال,السوشيال,حساباتنا,السوشيال ميديا"}
+MODE_LABELS = {"first": "أول رسالة فقط", "daily": "مرة كل 24 ساعة", "always": "كل رسالة"}
 SHAPE_ITEMS = [("t", "blk_link", "منع الروابط", "🔗"), ("t", "blk_mention", "منع المنشن", "📛"),
                ("t", "blk_forward", "منع المحوّلة", "↪️"), ("t", "blk_sticker", "منع الملصقات", "🎭"),
                ("t", "blk_voice", "منع الصوتيات", "🎙"), ("t", "blk_media", "منع الصور والفيديو", "🖼"),
@@ -415,8 +428,10 @@ MENUS = {
     "reply": ("🤖", "إدارة الردود التلقائية", "ردود تلقائية على كلمات عملائك داخل محادثاتك.", [
         ("t", "auto_on", "تفعيل الردود", "⚡"), ("a", "addrep", "إضافة رد", "➕"), ("a", "listrep", "عرض وحذف الردود", "📋")]),
     "welcome": ("👋", "إدارة رسالة الترحيب", "رسالة تُرسل لكل عميل جديد يراسلك (مع صورة إن أردت).", [
-        ("t", "welcome_on", "تفعيل الترحيب", "👋"), ("e", "biz_welcome", "تعديل نص الترحيب", "✏️"),
-        ("a", "photo", "تعيين صورة الترحيب", "🖼"), ("a", "photo_del", "حذف الصورة", "🗑")]),
+        ("t", "welcome_on", "تفعيل الترحيب", "👋"), ("a", "welcome_mode", "وضع الترحيب", "🔁"),
+        ("e", "biz_welcome", "تعديل نص الترحيب", "✏️"), ("a", "photo", "تعيين صورة الترحيب", "🖼"),
+        ("a", "photo_del", "حذف الصورة", "🗑"), ("a", "sticker", "تعيين ملصق الترحيب", "🎭"),
+        ("a", "sticker_del", "حذف الملصق", "❌")]),
     "muted": ("🔕", "إدارة المكتومين", "المكتوم تُحذف رسائله تلقائياً من محادثتك.", [
         ("a", "mute", "كتم مستخدم", "🔇"), ("a", "listmute", "المكتومون / فك الكتم", "📋")]),
     "banned": ("⛔", "الكلمات الممنوعة", "أي رسالة تحتوي كلمة ممنوعة تُحذف تلقائياً.", [
@@ -440,11 +455,19 @@ MENUS = {
     "calc": ("🧮", "الآلة الحاسبة", "يكتب العميل <code>= 25*4</code> أو <code>احسب 25*4</code> فيجيبه البوت بالنتيجة.", [
         ("t", "calc_on", "تفعيل الحاسبة لعملائك", "🧮")]),
     "clock": ("⏱", "الساعة الحية", "يظهر الوقت بجانب اسمك ويتحدث كل دقيقة.", [
-        ("t", "clock_on", "تفعيل الساعة", "⏱"), ("a", "tz", "فرق التوقيت", "🌍"), ("a", "clock_fmt", "صيغة الساعة", "🕐")]),
+        ("t", "clock_on", "تفعيل الساعة", "⏱"), ("a", "tz", "ضبط يدوي (ساعات)", "🌍"), ("a", "clock_fmt", "صيغة الساعة", "🕐")]),
     "bio": ("🔄", "البايو الحي", "يتحدث البايو تلقائياً مع الوقت.", [
         ("t", "bio_on", "تفعيل البايو", "🔄"), ("a", "bio_set", "نص البايو", "✏️")]),
     "anti": ("🛡", "ضد الحذف والتعديل", "يصلك إشعار عند حذف أو تعديل العميل لرسالته.", [
         ("t", "log_edit", "رصد التعديل", "✏️"), ("t", "log_del", "رصد الحذف", "🗑")]),
+    "fonts": ("🔤", "زخرفة الخطوط", "يكتب العميل <code>زخرفة اسمك</code> فيرد البوت بعدة أشكال مزخرفة جاهزة للنسخ.", [
+        ("t", "fonts_on", "تفعيل الزخرفة لعملائك", "🔤")]),
+    "ai": ("🧠", "الذكاء الاصطناعي", "يجيب البوت عملاءك بذكاء عندما يكتبون <code>ai سؤالك</code> أو <code>اسأل سؤالك</code>.", [
+        ("t", "ai_on", "تفعيل الذكاء الاصطناعي", "🧠"), ("e", "ai_sys", "تعليمات الذكاء (شخصيته)", "✏️")]),
+    "trans": ("🌐", "الترجمة الفورية", "يكتب العميل <code>ترجم نصك</code> فيترجمه البوت للغة التي تحددها.", [
+        ("t", "trans_on", "تفعيل الترجمة", "🌐"), ("a", "trans_lang", "اللغة الهدف", "🌍")]),
+    "games": ("🎮", "ألعاب الشات", "يكتب أحد الطرفين <code>العاب</code> في المحادثة فتظهر لوحة ألعاب (XO، حجر ورقة مقص، خمن الرقم) يلعبها صاحب الحساب والعميل معاً.", [
+        ("t", "games_on", "تفعيل الألعاب", "🎮")]),
     "shapes": ("🔍", "فحص أشكال الرسائل", "اختر أنواع الرسائل التي تُحذف من عملائك تلقائياً.", SHAPE_ITEMS),
     # ===== قوائم المالك =====
     "tenants": ("👥", "إدارة العملاء", "كل من ربط حسابه بالبوت. تحكّم بمدة اشتراكه وحظره.", [
@@ -759,7 +782,7 @@ async def cmd_panel(m: Message, state: FSMContext):
     await state.clear()
     if not can_tenant(m.from_user.id):
         return await m.answer(T("howto"))
-    await with_fallback(m.answer, tenant_kb(), text=tenant_header(m.from_user.id))
+    await with_fallback(m.answer, tenant_kb(m.from_user.id), text=tenant_header(m.from_user.id))
 
 
 @router.message(Command("admin"), F.chat.type == "private", ADMIN)
@@ -785,6 +808,15 @@ async def cmd_calc(m: Message):
         await m.answer(f"🧮 <code>{esc(args[1])}</code>\n✅ <b>{safe_calc(args[1])}</b>")
     except Exception:
         await m.answer(T("calc_bad"))
+
+
+@router.message(Command("font"), F.chat.type == "private")
+async def cmd_font(m: Message):
+    args = (m.text or "").split(maxsplit=1)
+    styles = decorate(args[1]) if len(args) > 1 else []
+    if not styles:
+        return await m.answer("اكتب النص بعد الأمر، مثال:\n<code>/font Ahmed</code> أو <code>/font أحمد</code>")
+    await m.answer("🔤 <b>زخرفة</b>\n\n" + "\n".join(f"<code>{esc(x)}</code>" for x in styles))
 
 
 @router.callback_query(F.data == "check_sub")
@@ -862,19 +894,28 @@ async def calc_input(m: Message):
 # ════════════════════════ اللوحات ════════════════════════
 def tenant_header(uid):
     label, left = status_info(uid)
-    running = on("bot_on") and on("bot_on", pfx(uid))
-    lines = [f"📌 حالة البوت: <b>{'✅ مفعّل' if running else '⛔ معطّل'}</b>", f"🪪 حالة الحساب: <b>{label}</b>"]
-    if left:
-        lines.append(f"⏳ المدة المتبقية: <b>{left}</b>")
-    lines.append(f"👥 عملاؤك: <b>{my_customers(uid)}</b>")
-    text = f"{T('panel')}\n\n<blockquote>" + "\n".join(lines) + "</blockquote>\n\n" + T("panel_hint")
+    text = (f"<blockquote>{T('panel')}\nحالة الحساب: <b>{label}</b>\n"
+            f"المدة المتبقية: <b>{left or 'غير محدودة'}</b></blockquote>")
+    hint = get("txt_panel_hint")
+    if hint:
+        text += "\n" + hint
     if not active(uid):
         text += "\n\n" + T("expired")
     return text
 
 
-def tenant_kb():
-    return kb([[btn(k, d) for k, _, _, d in row] for row in TENANT_PANEL])
+def tenant_kb(uid=None):
+    rows = []
+    for row in TENANT_PANEL:
+        r = []
+        for k, _l, _e, d in row:
+            if k == "p_toggle" and uid is not None:
+                running = on("bot_on") and on("bot_on", pfx(uid))
+                r.append(btn(k, d, suffix=": " + plain("on_label" if running else "off_label")))
+            else:
+                r.append(btn(k, d))
+        rows.append(r)
+    return kb(rows)
 
 
 def admin_header():
@@ -899,7 +940,7 @@ def menu_extra(name, uid):
     if name == "gforce":
         return f"📢 القناة الحالية: <b>{esc(get('force_channel')) or 'غير مضبوطة'}</b>"
     if name == "clock":
-        return f"🌍 فرق التوقيت: <b>UTC{esc(get(pre + 'tz', '3'))}</b>\n🕐 الصيغة: <code>{esc(get(pre + 'clock_fmt', '🕐 {time}'))}</code>"
+        return f"🕐 الوقت الآن: <b>{now_str(pre)}</b>\n🌍 فرق التوقيت: <b>UTC{esc(get(pre + 'tz', '3'))}</b>\n🕐 الصيغة: <code>{esc(get(pre + 'clock_fmt', '🕐 {time}'))}</code>"
     if name == "bio":
         return f"📝 النص الحالي: <code>{esc(get(pre + 'bio_text', '🕐 {time}'))}</code>"
     if name == "links":
@@ -908,7 +949,18 @@ def menu_extra(name, uid):
                 f"👤 زر المطور: {esc(get('dev_url', DEV_URL)) or '—'}")
     if name == "welcome":
         p = get(pre + "welcome_photo", "")
-        return "🖼 الصورة: " + ("<b>مخصصة ✅</b>" if p and p != "-" else "<b>بدون صورة</b>")
+        return (f"🔁 الوضع: <b>{MODE_LABELS.get(get(pre + 'welcome_mode', 'first'), '')}</b>\n"
+                f"📝 النص: <b>{'مخصص ✅' if get(pre + 'txt_biz_welcome') else 'افتراضي'}</b>\n"
+                f"🖼 الصورة: <b>{'مضافة ✅' if p and p != '-' else 'غير مضافة'}</b>\n"
+                f"🎭 الملصق: <b>{'مضاف ✅' if get(pre + 'welcome_sticker') else 'غير مضاف'}</b>")
+    if name == "fonts":
+        return "💡 مثال: العميل يكتب <code>زخرفة Ahmed</code> أو <code>زخرفة أحمد</code>"
+    if name == "ai":
+        return (f"🔑 مفتاح Claude: <b>{'مضبوط ✅' if AI_KEY else '❌ غير مضبوط (ANTHROPIC_API_KEY)'}</b>\n"
+                f"📊 الحد اليومي لكل حساب: <b>{AI_DAILY_LIMIT}</b> رسالة")
+    if name == "trans":
+        return (f"🌍 اللغة الهدف: <b>{esc(get(pre + 'trans_lang', 'العربية'))}</b>\n"
+                f"🔑 مفتاح Claude: <b>{'مضبوط ✅' if AI_KEY else '❌ غير مضبوط (ANTHROPIC_API_KEY)'}</b>")
     if name == "gwelcome":
         p = get("welcome_photo", "")
         return ("🖼 الصورة: " + ("<b>محذوفة</b>" if p == "-" else "<b>مخصصة ✅</b>" if p else "<b>افتراضية</b>")
@@ -945,12 +997,16 @@ def menu_view(name, uid):
             rows.append([btn(bk, f"t:{key}:{name}", style="success" if st else "danger",
                              suffix=": " + plain("on_label" if st else "off_label"))])
             continue
-        pend.append(btn(bk, {"a": f"a:{key}:{name}", "e": f"e:{key}:{name}", "v": f"v:{key}:{name}"}[kind]))
+        sfx = (": " + MODE_LABELS.get(get(pre + "welcome_mode", "first"), "")) if key == "welcome_mode" else ""
+        pend.append(btn(bk, {"a": f"a:{key}:{name}", "e": f"e:{key}:{name}", "v": f"v:{key}:{name}"}[kind], suffix=sfx))
         if len(pend) == 2:
             rows.append(pend)
             pend = []
     if pend:
         rows.append(pend)
+    if name == "clock":
+        rows.append([raw("➕ ساعة", "tzd:1", "success"), raw("➕ 15 د", "tzd:0.25", "success"),
+                     raw("➖ 15 د", "tzd:-0.25", "danger"), raw("➖ ساعة", "tzd:-1", "danger")])
     rows.append([btn("back", "p:admin" if name in ADMIN_MENUS else "p:home")])
     return text, kb(rows)
 
@@ -977,7 +1033,7 @@ def custom_home():
 
 def view_of(name, uid):
     if name == "home":
-        return tenant_header(uid), tenant_kb()
+        return tenant_header(uid), tenant_kb(uid)
     if name == "admin":
         return admin_header(), admin_kb()
     if name == "custom":
@@ -992,7 +1048,7 @@ async def cb_panel_home(c: CallbackQuery, state: FSMContext):
     await state.clear()
     if not can_tenant(c.from_user.id):
         return await c.answer(cut(plain("no_connect"), 190), show_alert=True)
-    await show(c, tenant_header(c.from_user.id), tenant_kb())
+    await show(c, tenant_header(c.from_user.id), tenant_kb(c.from_user.id))
     await c.answer()
 
 
@@ -1056,9 +1112,29 @@ async def cb_toggle(c: CallbackQuery, bot: Bot):
             await reset_names(bot, uid)
         if key == "bio_on":
             await (bio_enable(bot, uid) if new else bio_restore(bot, uid))
+        if new and key in ("clock_on", "bio_on"):
+            kv_del(pre + "warned_" + key[:-3])
     text, markup = view_of(back, uid)
     await show(c, text, markup)
     await c.answer("✅ مفعّل" if new else "⛔ معطّل")
+
+
+@router.callback_query(F.data.startswith("tzd:"))
+async def cb_tzd(c: CallbackQuery):
+    uid = c.from_user.id
+    if not can_tenant(uid):
+        return await deny(c)
+    pre = pfx(uid)
+    try:
+        cur = float(get(pre + "tz", "3") or 3)
+        delta = float(c.data[4:])
+    except ValueError:
+        return await c.answer()
+    new = max(-12.0, min(14.0, round((cur + delta) * 4) / 4))
+    put(pre + "tz", f"{new:g}")
+    text, markup = view_of("clock", uid)
+    await show(c, text, markup)
+    await c.answer(f"UTC{new:+g}")
 
 
 # ---- القوائم القابلة للحذف ----
@@ -1151,6 +1227,8 @@ PROMPTS = {
 for _k in ("rates", "pay", "codes", "social"):
     PROMPTS["trg_" + _k] = ("🔑 أرسل كلمات التفعيل مفصولة بفاصلة. عندما يكتب العميل إحداها يرد البوت بهذا القسم.\n"
                             f"الافتراضي: <code>{TRIG_DEFAULT[_k]}</code>")
+PROMPTS["sticker"] = "🎭 أرسل الملصق الذي تريده أن يُرسل مع رسالة الترحيب:"
+PROMPTS["trans_lang"] = "🌍 أرسل اسم اللغة الهدف للترجمة (مثال: العربية أو English أو Français):"
 OWNER_ACTS = {"admin_add", "admin_list", "owner_set", "reset_all", "reset_do", "restore", "backup"}
 GLOBAL_ACTS = {"set_botch", "set_devch", "set_devurl", "gbc", "owner_set", "admin_add", "trial_set", "restore",
                "label", "icon"}
@@ -1187,6 +1265,16 @@ async def cb_action(c: CallbackQuery, state: FSMContext, bot: Bot):
         await show(c, gstats_text(), kb([[btn("back", back)]]))
     elif a == "tenants_list":
         text, markup = tenants_list_view(0)
+        await show(c, text, markup)
+    elif a == "welcome_mode":
+        order = ["first", "daily", "always"]
+        cur = get(pre + "welcome_mode", "first")
+        put(pre + "welcome_mode", order[(order.index(cur) + 1) % 3] if cur in order else "first")
+        text, markup = view_of(menu, uid)
+        await show(c, text, markup)
+    elif a == "sticker_del":
+        kv_del(pre + "welcome_sticker")
+        text, markup = view_of(menu, uid)
         await show(c, text, markup)
     elif a == "photo_del":
         put(pre + "welcome_photo", "-")
@@ -1495,16 +1583,25 @@ def spawn(coro):
 async def send_biz_welcome(bot, chat_id, conn, pre, name):
     text = render(T("biz_welcome", pre), name)
     photo = get(pre + "welcome_photo", "")
+    sent = False
     if photo and photo != "-":
         try:
-            return await bot.send_photo(chat_id=chat_id, photo=photo, caption=text, business_connection_id=conn)
+            await bot.send_photo(chat_id=chat_id, photo=photo, caption=text, business_connection_id=conn)
+            sent = True
         except TelegramBadRequest as e:
             log.warning("welcome photo: %s", e)
-    return await send_text(bot, chat_id, text, conn=conn)
+    if not sent:
+        await send_text(bot, chat_id, text, conn=conn)
+    sticker = get(pre + "welcome_sticker", "")
+    if sticker:
+        try:
+            await bot.send_sticker(chat_id=chat_id, sticker=sticker, business_connection_id=conn)
+        except Exception as e:
+            log.warning("welcome sticker: %s", e)
 
 
 TEXT_ONLY = {"addrep", "addban", "mute", "bc", "gbc", "force_set", "set_botch", "set_devch", "set_devurl", "social_add",
-             "tz", "clock_fmt", "bio_set", "label", "text", "media_kw", "admin_add", "owner_set", "trial_set"}
+             "tz", "clock_fmt", "bio_set", "label", "text", "media_kw", "admin_add", "owner_set", "trial_set", "trans_lang"}
 
 
 @router.message(StateFilter(Form.wait), F.chat.type == "private")
@@ -1583,6 +1680,12 @@ async def got_input(m: Message, state: FSMContext, bot: Bot):
         if pre:
             return await send_biz_welcome(bot, m.chat.id, None, pre, m.from_user.full_name)
         return await send_home(bot, m.chat.id, m.from_user)
+
+    if a == "sticker":
+        if not m.sticker:
+            return await m.answer("⚠️ أرسل ملصقاً.")
+        put(pre + "welcome_sticker", m.sticker.file_id)
+        return await finish(m, state, "✅ تم حفظ ملصق الترحيب.", back)
 
     if a == "restore":
         if not is_owner(uid):
@@ -1687,6 +1790,9 @@ async def got_input(m: Message, state: FSMContext, bot: Bot):
     elif a == "bio_set":
         put(pre + "bio_text", t[:70])
         r = "✅ تم حفظ نص البايو."
+    elif a == "trans_lang":
+        put(pre + "trans_lang", t[:30])
+        r = f"✅ اللغة الهدف: {esc(t[:30])}"
     elif a == "trial_set":
         if not t.isdigit():
             return await m.answer("⚠️ أرسل رقماً (0 = بلا حدود).")
@@ -1732,7 +1838,7 @@ async def on_conn(c: BusinessConnection, bot: Bot):
            c.id, uid, chat, c.user.first_name, c.user.last_name or "")
         try:
             await send_text(bot, chat, T("connected"))
-            await with_fallback(bot.send_message, tenant_kb(), chat_id=chat, text=tenant_header(uid))
+            await with_fallback(bot.send_message, tenant_kb(uid), chat_id=chat, text=tenant_header(uid))
         except Exception as e:
             log.warning("connected msg: %s", e)
         if is_new:
@@ -1784,6 +1890,64 @@ def cache_put(m, text):
        text or f"[{m.content_type}]", int(time.time()))
 
 
+def _shift(up, low):
+    d = {}
+    for i in range(26):
+        d[ord("A") + i] = chr(up + i)
+        d[ord("a") + i] = chr(low + i)
+    return d
+
+
+FONT_MAPS = [_shift(0x1D5D4, 0x1D5EE), _shift(0x1D608, 0x1D622), _shift(0x1D63C, 0x1D656), _shift(0x1D670, 0x1D68A),
+             _shift(0x1D4D0, 0x1D4EA), _shift(0x1D56C, 0x1D586), _shift(0x1D400, 0x1D41A), _shift(0x1D468, 0x1D482),
+             _shift(0x24B6, 0x24D0), _shift(0xFF21, 0xFF41)]
+
+
+def decorate(text):
+    text = text.strip()[:40]
+    out = []
+    if re.search(r"[A-Za-z]", text):
+        out += [text.translate(mp) for mp in FONT_MAPS]
+    if re.search(r"[\u0600-\u06FF]", text):
+        tat = " ".join("ـ".join(w) for w in text.split())
+        out += [tat, f"꧁ {text} ꧂", f"✦ {tat} ✦", f"﴾ {text} ﴿", f"『 {text} 』", f"☆ {text} ☆",
+                f"•°•{text}•°•", f"❖ {text} ❖"]
+    return out[:12]
+
+
+_ai_cnt = {}
+
+
+def ai_allowed(tid):
+    key = (tid, datetime.now(timezone.utc).strftime("%Y%m%d"))
+    for k in [k for k in _ai_cnt if k[1] != key[1]]:
+        _ai_cnt.pop(k, None)
+    if _ai_cnt.get(key, 0) >= AI_DAILY_LIMIT:
+        return False
+    _ai_cnt[key] = _ai_cnt.get(key, 0) + 1
+    return True
+
+
+async def claude_ask(system, prompt, max_tokens=600):
+    if not AI_KEY:
+        return None
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=40)) as sess:
+            async with sess.post("https://api.anthropic.com/v1/messages",
+                                 headers={"x-api-key": AI_KEY, "anthropic-version": "2023-06-01",
+                                          "content-type": "application/json"},
+                                 json={"model": AI_MODEL, "max_tokens": max_tokens, "system": system,
+                                       "messages": [{"role": "user", "content": prompt[:2000]}]}) as r:
+                data = await r.json()
+                if r.status != 200:
+                    log.warning("claude api %s: %s", r.status, str(data)[:200])
+                    return None
+                return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip() or None
+    except Exception as e:
+        log.warning("claude api: %s", e)
+        return None
+
+
 def triggers(pre, k):
     return [x.strip().lower() for x in get(pre + "trg_" + k, TRIG_DEFAULT[k]).split(",") if x.strip()]
 
@@ -1805,6 +1969,30 @@ async def handle_triggers(bot, m, pre, tid, low, conn):
             except Exception:
                 await send_text(bot, m.chat.id, title + "\n" + "\n".join(f"• {esc(n)}: {u}" for n, u in socials), conn=conn)
             return True
+    orig = (m.text or m.caption or "").strip()
+    parts = orig.split(None, 1)
+    body = parts[1].strip() if len(parts) > 1 else ""
+    if body and on("fonts_on", pre) and low.split(None, 1)[0] in ("زخرفة", "زخرف", "font"):
+        styles = decorate(body)
+        if styles:
+            await send_text(bot, m.chat.id, "🔤 <b>زخرفة</b>\n\n" + "\n".join(f"<code>{esc(x)}</code>" for x in styles), conn=conn)
+            return True
+    if body and AI_KEY and low.split(None, 1)[0] in ("ai", "اسأل", "ذكاء", "ترجم", "translate"):
+        first = low.split(None, 1)[0]
+        is_tr = first in ("ترجم", "translate")
+        if (is_tr and on("trans_on", pre)) or (not is_tr and on("ai_on", pre)):
+            if not ai_allowed(tid):
+                await send_text(bot, m.chat.id, "⏳ تم الوصول للحد اليومي للردود الذكية، حاول غداً.", conn=conn)
+                return True
+            if is_tr:
+                system = (f"Translate the user's text into {get(pre + 'trans_lang', 'العربية')}. "
+                          "Output only the translation, with no explanations.")
+            else:
+                system = T("ai_sys", pre)
+            ans = await claude_ask(system, body)
+            if ans:
+                await send_text(bot, m.chat.id, esc(ans), conn=conn)
+            return True
     if on("calc_on", pre) and (low.startswith("=") or low.startswith("احسب")):
         expr = low[1:] if low.startswith("=") else low[4:]
         try:
@@ -1825,9 +2013,16 @@ async def on_biz(m: Message, bot: Bot):
     pre, uid, conn = pfx(owner), m.from_user.id, m.business_connection_id
     text = m.text or m.caption or ""
     cache_put(m, text)
+    low = text.lower().strip()
+    if (low in ("العاب", "ألعاب", "games", "لعبة") and on("bot_on") and on("bot_on", pre) and on("games_on", pre)
+            and not q("SELECT 1 FROM t_muted WHERE tid=? AND uid=?", owner, uid)):
+        try:
+            await send_game_menu(bot, m.chat.id, conn, owner)
+        except Exception as e:
+            log.warning("games: %s", e)
+        return
     if uid == owner or not on("bot_on") or not on("bot_on", pre):
         return
-    low = text.lower().strip()
 
     muted = bool(q("SELECT 1 FROM t_muted WHERE tid=? AND uid=?", owner, uid))
     reason = "مكتوم" if muted else violation(m, low, pre, owner)
@@ -1859,12 +2054,18 @@ async def on_biz(m: Message, bot: Bot):
                 log.warning("force prompt: %s", e)
         return
 
-    if ex("INSERT OR IGNORE INTO customers(conn, uid, chat, name, ts) VALUES(?,?,?,?,?)",
-          conn, uid, m.chat.id, m.from_user.full_name, int(time.time())) and on("welcome_on", pre):
-        try:
-            await send_biz_welcome(bot, m.chat.id, conn, pre, m.from_user.full_name)
-        except Exception as e:
-            log.warning("welcome: %s", e)
+    now = int(time.time())
+    is_new = bool(ex("INSERT OR IGNORE INTO customers(conn, uid, chat, name, ts, lw) VALUES(?,?,?,?,?,0)",
+                     conn, uid, m.chat.id, m.from_user.full_name, now))
+    if on("welcome_on", pre):
+        mode = get(pre + "welcome_mode", "first")
+        lw = (q("SELECT lw FROM customers WHERE conn=? AND uid=?", conn, uid) or [(0,)])[0][0] or 0
+        if is_new or mode == "always" or (mode == "daily" and now - lw > 86400):
+            ex("UPDATE customers SET lw=? WHERE conn=? AND uid=?", now, conn, uid)
+            try:
+                await send_biz_welcome(bot, m.chat.id, conn, pre, m.from_user.full_name)
+            except Exception as e:
+                log.warning("welcome: %s", e)
 
     if not text:
         return
@@ -1927,6 +2128,169 @@ async def on_del(d: BusinessMessagesDeleted, bot: Bot):
                         f"💬 نص الرسالة:\n{esc(cut(text, 1500))}</blockquote>")
 
 
+# ════════════════════════ ألعاب الشات ════════════════════════
+_rps, _gn = {}, {}
+WHO = {"x": "❌ صاحب الحساب", "o": "⭕ العميل"}
+
+
+async def send_game_menu(bot, chat_id, conn, owner):
+    base = f"{owner}:{chat_id}"
+    mk = kb([[raw("❌⭕ XO", f"gm:{base}:xo"), raw("🪨📄✂️ حجر ورقة مقص", f"gm:{base}:rps")],
+             [raw("🔢 خمن الرقم", f"gm:{base}:gn")]])
+    await send_text(bot, chat_id, "🎮 <b>ألعاب الشات</b>\nاختر لعبة يلعبها الطرفان معاً 👇", conn=conn, markup=mk)
+
+
+async def g_edit(bot, c, owner, text, markup):
+    msg = c.message
+    if msg is None:
+        return
+    conn = getattr(msg, "business_connection_id", None)
+    if not conn:
+        r = q("SELECT id FROM bconns WHERE owner=?", owner)
+        conn = r[0][0] if r else None
+    try:
+        await bot.edit_message_text(text=text, chat_id=msg.chat.id, message_id=msg.message_id,
+                                    business_connection_id=conn, reply_markup=markup)
+    except TelegramBadRequest as e:
+        if "not modified" not in str(e).lower():
+            log.warning("game edit: %s", e)
+
+
+def xo_winner(b):
+    for x, y, z in ((0, 1, 2), (3, 4, 5), (6, 7, 8), (0, 3, 6), (1, 4, 7), (2, 5, 8), (0, 4, 8), (2, 4, 6)):
+        if b[x] != "." and b[x] == b[y] == b[z]:
+            return b[x]
+    return "draw" if "." not in b else None
+
+
+def xo_markup(board, turn, owner, cust, over=False):
+    sym = {"x": "❌", "o": "⭕", ".": "⬜"}
+    rows = []
+    for r in range(3):
+        row = []
+        for k in range(3):
+            i = r * 3 + k
+            if board[i] == "." and not over:
+                row.append(raw(sym["."], f"gx:{board}:{turn}:{i}:{owner}:{cust}"))
+            else:
+                row.append(raw(sym[board[i]], "noop"))
+        rows.append(row)
+    if over:
+        rows.append([raw("🔄 لعبة جديدة", f"gm:{owner}:{cust}:xo")])
+    return kb(rows)
+
+
+def rps_markup(owner, cust):
+    return kb([[raw("🪨 حجر", f"gr:r:{owner}:{cust}"), raw("📄 ورقة", f"gr:p:{owner}:{cust}"),
+                raw("✂️ مقص", f"gr:s:{owner}:{cust}")]])
+
+
+def gn_markup(tried, owner, cust):
+    btns = [raw("✖️" if k in tried else str(k), "noop" if k in tried else f"gg:{k}:{owner}:{cust}") for k in range(1, 11)]
+    return kb([btns[:5], btns[5:]])
+
+
+@router.callback_query(F.data.startswith("gm:"))
+async def cb_game_start(c: CallbackQuery, bot: Bot):
+    _, owner, cust, game = c.data.split(":")
+    owner, cust = int(owner), int(cust)
+    if c.from_user.id not in (owner, cust):
+        return await c.answer("هذه الألعاب لطرفي المحادثة فقط.", show_alert=True)
+    if c.message is None:
+        return await c.answer()
+    key = (c.message.chat.id, c.message.message_id)
+    if game == "xo":
+        await g_edit(bot, c, owner, f"🎮 <b>XO</b>\nالدور: {WHO['x']}", xo_markup("." * 9, "x", owner, cust))
+    elif game == "rps":
+        if len(_rps) > 500:
+            _rps.clear()
+        _rps[key] = {}
+        await g_edit(bot, c, owner, "🪨📄✂️ <b>حجر ورقة مقص</b>\nيختار كل طرف سراً 👇", rps_markup(owner, cust))
+    elif game == "gn":
+        if len(_gn) > 500:
+            _gn.clear()
+        _gn[key] = {"t": random.randint(1, 10), "left": 3, "tried": set()}
+        await g_edit(bot, c, owner, "🔢 <b>خمن الرقم</b>\nرقم بين 1 و 10، ولديكما 3 محاولات مشتركة 👇",
+                     gn_markup(set(), owner, cust))
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("gx:"))
+async def cb_xo(c: CallbackQuery, bot: Bot):
+    _, board, turn, idx, owner, cust = c.data.split(":")
+    owner, cust, idx = int(owner), int(cust), int(idx)
+    uid = c.from_user.id
+    if uid not in (owner, cust):
+        return await c.answer("هذه اللعبة لطرفي المحادثة فقط.", show_alert=True)
+    if uid != (owner if turn == "x" else cust):
+        return await c.answer("⏳ ليس دورك!", show_alert=True)
+    if board[idx] != ".":
+        return await c.answer()
+    board = board[:idx] + turn + board[idx + 1:]
+    w = xo_winner(board)
+    if w:
+        text = "🤝 <b>تعادل!</b>" if w == "draw" else f"🏆 <b>فاز {WHO[w]}!</b>"
+        await g_edit(bot, c, owner, "🎮 <b>XO</b>\n" + text, xo_markup(board, turn, owner, cust, True))
+    else:
+        nt = "o" if turn == "x" else "x"
+        await g_edit(bot, c, owner, f"🎮 <b>XO</b>\nالدور: {WHO[nt]}", xo_markup(board, nt, owner, cust))
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("gr:"))
+async def cb_rps(c: CallbackQuery, bot: Bot):
+    _, ch, owner, cust = c.data.split(":")
+    owner, cust, uid = int(owner), int(cust), c.from_user.id
+    if uid not in (owner, cust) or c.message is None:
+        return await c.answer("هذه اللعبة لطرفي المحادثة فقط.", show_alert=True)
+    key = (c.message.chat.id, c.message.message_id)
+    st = _rps.setdefault(key, {})
+    if uid in st:
+        return await c.answer("اخترت مسبقاً ✅", show_alert=True)
+    st[uid] = ch
+    if len(st) < 2:
+        who = "صاحب الحساب" if uid == owner else "العميل"
+        await g_edit(bot, c, owner, f"🪨📄✂️ <b>حجر ورقة مقص</b>\n✅ اختار: {who}\n⏳ بانتظار الطرف الآخر",
+                     rps_markup(owner, cust))
+        return await c.answer("تم اختيارك ✅")
+    a, b = st.get(owner), st.get(cust)
+    _rps.pop(key, None)
+    em = {"r": "🪨", "p": "📄", "s": "✂️"}
+    beats = {"r": "s", "p": "r", "s": "p"}
+    res = "🤝 <b>تعادل!</b>" if a == b else (f"🏆 <b>فاز {WHO['x']}!</b>" if beats[a] == b else f"🏆 <b>فاز {WHO['o']}!</b>")
+    await g_edit(bot, c, owner, f"🪨📄✂️ <b>حجر ورقة مقص</b>\n{WHO['x']}: {em[a]}\n{WHO['o']}: {em[b]}\n\n{res}",
+                 kb([[raw("🔄 جولة جديدة", f"gm:{owner}:{cust}:rps")]]))
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("gg:"))
+async def cb_guess(c: CallbackQuery, bot: Bot):
+    _, k, owner, cust = c.data.split(":")
+    k, owner, cust, uid = int(k), int(owner), int(cust), c.from_user.id
+    if uid not in (owner, cust) or c.message is None:
+        return await c.answer("هذه اللعبة لطرفي المحادثة فقط.", show_alert=True)
+    st = _gn.get((c.message.chat.id, c.message.message_id))
+    if not st:
+        return await c.answer("انتهت اللعبة، ابدأ لعبة جديدة بكتابة: العاب", show_alert=True)
+    who = "صاحب الحساب" if uid == owner else "العميل"
+    if k == st["t"]:
+        _gn.pop((c.message.chat.id, c.message.message_id), None)
+        await g_edit(bot, c, owner, f"🔢 <b>خمن الرقم</b>\n🎉 <b>{who}</b> خمّن الرقم الصحيح: <b>{k}</b>",
+                     kb([[raw("🔄 لعبة جديدة", f"gm:{owner}:{cust}:gn")]]))
+    else:
+        st["left"] -= 1
+        st["tried"].add(k)
+        if st["left"] <= 0:
+            _gn.pop((c.message.chat.id, c.message.message_id), None)
+            await g_edit(bot, c, owner, f"🔢 <b>خمن الرقم</b>\n😅 انتهت المحاولات! الرقم كان <b>{st['t']}</b>",
+                         kb([[raw("🔄 لعبة جديدة", f"gm:{owner}:{cust}:gn")]]))
+        else:
+            hint = "🔼 أكبر" if k < st["t"] else "🔽 أصغر"
+            await g_edit(bot, c, owner, f"🔢 <b>خمن الرقم</b>\n❌ {who} اختار {k}: الرقم {hint}\nالمحاولات المتبقية: {st['left']}",
+                         gn_markup(st["tried"], owner, cust))
+    await c.answer()
+
+
 # ════════════════════════ ردّ احتياطي ════════════════════════
 @router.callback_query()
 async def cb_fallback(c: CallbackQuery):
@@ -1937,6 +2301,23 @@ async def cb_fallback(c: CallbackQuery):
 
 
 # ════════════════════════ الساعة الحية والبايو الحي ════════════════════════
+async def live_err(bot, owner, pre, what, e):
+    """يسجّل الفشل ويرسل للعميل تنبيهاً واحداً يشرح الصلاحية الناقصة."""
+    log.warning("%s (%s): %s", what, owner, e)
+    key = f"{pre}warned_{what}"
+    if get(key) == "1":
+        return
+    put(key, "1")
+    names = {"clock": "الساعة الحية", "bio": "البايو الحي"}
+    try:
+        await send_text(bot, owner,
+                        f"⚠️ تعذّر تحديث <b>{names[what]}</b>.\n"
+                        "تأكد من صلاحيات البوت: الإعدادات ← Business ← الشات بوت ← فعّل «تغيير الاسم» و«تغيير النبذة (البايو)».\n"
+                        f"<code>{esc(cut(str(e), 120))}</code>")
+    except Exception:
+        pass
+
+
 async def live_loop(bot: Bot):
     last_min, last_prune = 0, 0
     while True:
@@ -1964,7 +2345,7 @@ async def live_loop(bot: Bot):
                     except TelegramRetryAfter as e:
                         await asyncio.sleep(e.retry_after)
                     except Exception as e:
-                        log.debug("clock: %s", e)
+                        await live_err(bot, owner, pre, "clock", e)
                 if on("bio_on", pre):
                     try:
                         await bot.set_business_account_bio(business_connection_id=cid,
@@ -1972,7 +2353,7 @@ async def live_loop(bot: Bot):
                     except TelegramRetryAfter as e:
                         await asyncio.sleep(e.retry_after)
                     except Exception as e:
-                        log.debug("bio: %s", e)
+                        await live_err(bot, owner, pre, "bio", e)
         except Exception as e:
             log.warning("live loop: %s", e)
 
