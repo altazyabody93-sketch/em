@@ -9,7 +9,7 @@
 
 import os, sys, json, time, shutil, signal, sqlite3, subprocess
 import threading, socket, re, random, zipfile, platform, urllib.request
-import secrets, ast
+import secrets, ast, html
 from datetime import datetime, timedelta
 
 import telebot
@@ -73,7 +73,29 @@ def init_db():
             user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
             created_at TEXT, is_banned INTEGER DEFAULT 0, is_premium INTEGER DEFAULT 0,
             max_projects INTEGER DEFAULT 3, total_uploads INTEGER DEFAULT 0,
-            theme_color TEXT DEFAULT 'blue')''')
+            theme_color TEXT DEFAULT 'blue', balance REAL DEFAULT 0.0,
+            referred_by INTEGER DEFAULT 0, referral_count INTEGER DEFAULT 0,
+            plan_expires TEXT DEFAULT '')''')
+        for _col_sql in [
+            "ALTER TABLE users ADD COLUMN balance REAL DEFAULT 0.0",
+            "ALTER TABLE users ADD COLUMN referred_by INTEGER DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN referral_count INTEGER DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN plan_expires TEXT DEFAULT ''",
+        ]:
+            try:
+                c.execute(_col_sql)
+            except sqlite3.OperationalError:
+                pass
+        c.execute('''CREATE TABLE IF NOT EXISTS recharge_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+            amount REAL NOT NULL, proof TEXT DEFAULT '',
+            status TEXT DEFAULT 'pending', created_at TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS gift_codes (
+            code TEXT PRIMARY KEY, amount REAL NOT NULL,
+            max_uses INTEGER DEFAULT 1, used_count INTEGER DEFAULT 0,
+            created_at TEXT)''')
+        c.execute("CREATE TABLE IF NOT EXISTS btn_custom (bkey TEXT PRIMARY KEY, label TEXT, style TEXT, icon TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS tpl_custom (tid TEXT PRIMARY KEY, text TEXT)")
         c.execute('''CREATE TABLE IF NOT EXISTS projects (
             id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER NOT NULL,
             name TEXT NOT NULL, ptype TEXT DEFAULT 'bot', path TEXT, entry TEXT,
@@ -164,8 +186,116 @@ def is_premium(uid):
 
 def get_max_projects(uid):
     u = get_user(uid)
-    if not u: return 3
+    if not u:
+        return int(float(get_ui("free_trial_projects") or 1)) if is_paid_mode() else 3
+    if is_paid_mode():
+        return u[6] if u[6] is not None else int(float(get_ui("free_trial_projects") or 1))
     return u[6] or 3
+
+
+def is_paid_mode():
+    return get_ui("bot_mode") == "paid"
+
+
+def get_balance(uid):
+    u = get_user(uid)
+    if not u or len(u) < 10 or u[9] is None:
+        return 0.0
+    return float(u[9])
+
+
+def add_balance(uid, amount):
+    with DB_LOCK:
+        conn = _conn(); c = conn.cursor()
+        c.execute("UPDATE users SET balance = COALESCE(balance, 0) + ? WHERE user_id=?", (float(amount), uid))
+        conn.commit(); conn.close()
+
+
+def set_max_projects(uid, val):
+    with DB_LOCK:
+        conn = _conn(); c = conn.cursor()
+        c.execute("UPDATE users SET max_projects = ? WHERE user_id=?", (int(val), uid))
+        conn.commit(); conn.close()
+
+
+def add_max_projects(uid, delta):
+    with DB_LOCK:
+        conn = _conn(); c = conn.cursor()
+        c.execute("UPDATE users SET max_projects = COALESCE(max_projects, 0) + ? WHERE user_id=?", (int(delta), uid))
+        conn.commit(); conn.close()
+
+
+def register_referral(new_uid, ref_uid):
+    if not ref_uid or ref_uid == new_uid:
+        return False
+    if not get_user(ref_uid):
+        return False
+    bonus = float(get_ui("referral_bonus") or 0.5)
+    with DB_LOCK:
+        conn = _conn(); c = conn.cursor()
+        c.execute("SELECT referred_by FROM users WHERE user_id=?", (new_uid,))
+        r = c.fetchone()
+        if r and r[0]:
+            conn.close()
+            return False
+        c.execute("UPDATE users SET referred_by=? WHERE user_id=?", (ref_uid, new_uid))
+        c.execute("UPDATE users SET referral_count = COALESCE(referral_count, 0) + 1, balance = COALESCE(balance, 0) + ? WHERE user_id=?", (bonus, ref_uid))
+        conn.commit(); conn.close()
+    return bonus
+
+
+def create_recharge_request(uid, amount, proof):
+    with DB_LOCK:
+        conn = _conn(); c = conn.cursor()
+        c.execute("INSERT INTO recharge_requests (user_id, amount, proof, status, created_at) VALUES (?, ?, ?, 'pending', ?)",
+                  (uid, float(amount), proof, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        rid = c.lastrowid; conn.commit(); conn.close(); return rid
+
+
+def get_recharge_request(rid):
+    with DB_LOCK:
+        conn = _conn(); c = conn.cursor()
+        c.execute("SELECT * FROM recharge_requests WHERE id=?", (rid,))
+        r = c.fetchone(); conn.close(); return r
+
+
+def get_pending_recharges():
+    with DB_LOCK:
+        conn = _conn(); c = conn.cursor()
+        c.execute("SELECT * FROM recharge_requests WHERE status='pending' ORDER BY id DESC LIMIT 20")
+        r = c.fetchall(); conn.close(); return r
+
+
+def resolve_recharge_request(rid, status):
+    with DB_LOCK:
+        conn = _conn(); c = conn.cursor()
+        c.execute("UPDATE recharge_requests SET status=? WHERE id=? AND status='pending'", (status, rid))
+        changed = c.rowcount; conn.commit(); conn.close(); return changed > 0
+
+
+def create_gift_code(code, amount, max_uses=1):
+    with DB_LOCK:
+        conn = _conn(); c = conn.cursor()
+        c.execute("REPLACE INTO gift_codes (code, amount, max_uses, used_count, created_at) VALUES (?, ?, ?, 0, ?)",
+                  (code.strip().upper(), float(amount), int(max_uses), datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        conn.commit(); conn.close()
+
+
+def redeem_gift_code(uid, code):
+    code = code.strip().upper()
+    with DB_LOCK:
+        conn = _conn(); c = conn.cursor()
+        c.execute("SELECT amount, max_uses, used_count FROM gift_codes WHERE code=?", (code,))
+        r = c.fetchone()
+        if not r:
+            conn.close(); return False, "❌ كود الشحن غير صحيح."
+        amt, mx, used = r
+        if used >= mx:
+            conn.close(); return False, "⚠️ تم استهلاك هذا الكود بالكامل."
+        c.execute("UPDATE gift_codes SET used_count = used_count + 1 WHERE code=?", (code,))
+        c.execute("UPDATE users SET balance = COALESCE(balance, 0) + ? WHERE user_id=?", (float(amt), uid))
+        conn.commit(); conn.close()
+    return True, amt
 
 
 # ============================================================
@@ -226,6 +356,13 @@ DEFAULT_UI = {
     "dashboard_title": "HOST BOT v12",
     "footer_text": "━━━━━━━━━━━━━━━━━━━━",
     "theme_color": "#2563eb",
+    "bot_mode": "free",
+    "currency_name": "$",
+    "slot_price": "2.0",
+    "vip_price": "5.0",
+    "referral_bonus": "0.5",
+    "free_trial_projects": "1",
+    "recharge_info": "لشحن رصيدك، قم بتحويل المبلغ المطلوب ثم أرسل رقم الحوالة أو إثبات الدفع ليتم التفعيل فوراً.",
 }
 
 # key: (الاسم+الإيموجي, اللون, الصف)
@@ -234,6 +371,7 @@ DEFAULT_BUTTONS = {
     "btn_new_project":  ("➕ مشروع جديد", "success", 1),
     "btn_account":      ("👤 حسابي", "primary", 2),
     "btn_help":         ("❓ مساعدة", "primary", 2),
+    "btn_wallet":       ("💳 محفظتي والشحن", "success", 3),
     "btn_support":      ("💬 تواصل مع الدعم", "primary", 3),
     "btn_admin":        ("👑 لوحة المطور", "danger", 4),
     "btn_dashboard":    ("🌐 لوحة التحكم", "primary", 0),
@@ -1480,8 +1618,62 @@ def _ph_name(node, used):
     return name
 
 
-def _clean_title(s):
-    return re.sub(r"[*`_]+", "", re.sub(r"\s+", " ", str(s))).strip()
+def _display_text(s):
+    """النص كما يُعرض في شاشة التصفح فقط: بلا وسوم HTML، بلا رموز تنسيق خام، وبلا خطوط فاصلة زخرفية."""
+    s = re.sub(r"<[^>]+>", " ", str(s or ""))
+    s = re.sub(r"[━═─—–=~*`_•·]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+_clean_title = _display_text
+
+_FRIENDLY_HINTS = {
+    "set_theme": "🎨 اختيار الثيم",
+    "ui_edit": "📝 تعديل نص عام",
+    "edit_btn": "🎛 تعديل زر",
+    "chg_row": "↕️ ترتيب الصف",
+    "chg_name": "✏️ تغيير الاسم",
+    "chg_style": "🌈 تغيير اللون",
+    "pfview": "📄 عرض ملف",
+    "pfdl": "📥 تحميل ملف",
+    "pfdel": "🗑 حذف ملف",
+    "pfdelok": "✅ تأكيد الحذف",
+    "pfiles": "📁 متصفح الملفات",
+    "penv": "🔐 محرر .env",
+    "proj": "📦 تفاصيل المشروع",
+    "start": "▶️ تشغيل المشروع",
+    "stop": "⏹️ إيقاف المشروع",
+    "restart": "🔁 إعادة التشغيل",
+    "logs": "📄 السجلات",
+    "smart": "🪄 تثبيت تلقائي ذكي",
+    "install": "⚙️ تثبيت المكتبات",
+    "files": "📁 الملفات",
+    "addfile": "➕ إضافة ملف",
+    "addpkg": "⚙️ تثبيت مكتبة",
+    "check": "🔍 فحص الملف",
+    "del": "🗑 حذف المشروع",
+    "cdel": "✅ تأكيد حذف المشروع",
+    "openweb": "🌐 فتح الموقع",
+    "upload_req": "📤 رفع المتطلبات",
+    "adm_rech_ok": "✅ قبول الشحن",
+    "adm_rech_no": "❌ رفض الشحن",
+}
+
+def _derive_clean_label(raw_label, key, func_name=""):
+    clean = _display_text(str(raw_label or "").replace("*", " "))
+    letters = len(re.findall(r"[\u0600-\u06FFA-Za-z]", clean))
+    if letters >= 3:
+        return clean
+    raw_key = str(key or "").split(":", 1)[-1]
+    for prefix, friendly in _FRIENDLY_HINTS.items():
+        if raw_key.startswith(prefix):
+            return friendly
+    hint = re.sub(r"^(cb_|admin_|btn_|adm_)", "", raw_key).replace("*", "").replace("_", " ").strip()
+    if len(re.findall(r"[\u0600-\u06FFA-Za-z]", hint)) >= 3:
+        return f"🔘 {hint[:28]}"
+    fn_hint = re.sub(r"^(cb_|hndl_|show_|do_)", "", str(func_name or "")).replace("_", " ").strip()
+    return f"🔘 {fn_hint[:28]}" if fn_hint else "🔘 زر واجهة"
 
 
 _ui_id = lambda s, n=10: hashlib.md5(str(s).encode("utf-8")).hexdigest()[:n] if False else None
@@ -1560,7 +1752,8 @@ def _scan_source(src):
                     key = "url:" + p
             elif "*" not in label:
                 key = "txt:" + label
-            return key, label.replace("*", "…").strip() or "(زر)"
+            clean = _derive_clean_label(label, key, self.func[-1])
+            return key, clean
 
         def visit_List(self, node):
             infos = [self._btn_info(e) if isinstance(e, _ast.Call) else None for e in node.elts]
@@ -1612,12 +1805,13 @@ def _scan_source(src):
         return fid, funcs[fid]
 
     groups = {}
-    _self_prefixes = ("pbtn_", "pgrp_", "ptpl_")
+    _self_prefixes = ("pbtn_", "pgrp_", "ptpl_", "admin_premium", "admin_backup_ui", "admin_restore_ui", "admin_backup_db", "admin_restore_db", "admin_buttons", "edit_btn_", "chg_name_", "chg_style_", "chg_row_")
     for fn, key, label in v.buttons:
+        if key.startswith(_self_prefixes) or fn in _PREMIUM_SELF_FUNCS:
+            continue
         if "*" in key:
-            if key.startswith(_self_prefixes):
-                continue
-            g = groups.setdefault(key, {"key": key, "label": label.replace("*", "…"), "count": 0})
+            glabel = _derive_clean_label(label, key, fn)
+            g = groups.setdefault(key, {"key": key, "label": glabel, "count": 0})
             g["count"] += 1
             continue
         bid = _ui_id(key, 8)
@@ -1651,17 +1845,110 @@ def _scan_source(src):
         tpls[tid] = {"parts": parts, "fid": fid, "names": names, "preview": prev}
         fo["tpls"].append(tid)
 
+    _SCREEN_TITLES = {
+        "main_menu": "🏠 القائمة الرئيسية",
+        "cmd_start": "🚀 رسالة الترحيب",
+        "cb_main": "🏠 القائمة الرئيسية (رجوع)",
+        "cb_my_projs": "📦 مشاريعي",
+        "cb_proj": "📦 تفاصيل المشروع",
+        "cb_start": "▶️ تشغيل المشروع",
+        "do_start": "🎉 تم التشغيل بنجاح",
+        "cb_logs": "📄 السجلات",
+        "cb_openweb": "🌐 فتح الموقع",
+        "cb_files": "📁 قائمة الملفات",
+        "cb_addfile": "📤 إضافة ملف",
+        "cb_addpkg": "⚙️ تثبيت مكتبة",
+        "do_addpkg": "⚙️ نتيجة تثبيت المكتبة",
+        "cb_smart": "🪄 التثبيت التلقائي الذكي",
+        "cb_install": "⚙️ تثبيت المتطلبات",
+        "do_install": "📊 نتيجة التثبيت",
+        "cb_account": "👤 حسابي",
+        "cb_my_theme": "🎨 تخصيص الألوان",
+        "cb_help": "📚 المساعدة",
+        "cb_contact_support": "💬 التواصل مع الدعم",
+        "do_support_msg": "💬 تأكيد إرسال الدعم",
+        "cb_new": "➕ مشروع جديد",
+        "cb_type": "📝 اسم المشروع",
+        "msg_name": "📤 رفع الملف الرئيسي",
+        "handle_doc": "📥 استلام الملفات",
+        "cb_upload_req": "📋 رفع requirements.txt",
+        "cb_del": "⚠️ تأكيد حذف المشروع",
+        "cb_admin": "👑 لوحة المطور",
+        "cb_admin_stats": "📊 إحصائيات الاستضافة",
+        "cb_admin_users": "👥 قائمة المستخدمين",
+        "cb_admin_projs": "📦 قائمة المشاريع",
+        "cb_admin_logs": "📋 سجل الأحداث",
+        "cb_admin_unban": "🔓 فك حظر مستخدم",
+        "cb_broadcast": "📢 إعلان عام",
+        "do_broadcast": "📢 حالة الإعلان العام",
+        "cb_admin_tunnel": "🔗 تحديث النفق",
+        "cb_wallet": "💳 محفظتي والشحن",
+        "cb_shop": "🛒 متجر الباقات",
+        "cb_referral": "🤝 نظام الإحالة",
+        "cb_admin_billing": "💰 إدارة المدفوعات والباقات",
+    }
+
+    def _meaningful(c):
+        c = _clean_title(c)
+        letters = len(re.findall(r"[\u0600-\u06FFA-Za-z]", c or ""))
+        return bool(c) and letters >= 3 and letters / max(len(c), 1) >= 0.25
+
     for fid, fo in funcs.items():
-        if fo["tpls"]:
-            fo["title"] = tpls[fo["tpls"][0]]["preview"][:30] or fo["name"]
-        elif fo["btns"]:
-            fo["title"] = buttons[fo["btns"][0]]["label"][:30] or fo["name"]
+        if fo["name"] in _SCREEN_TITLES:
+            fo["title"] = _SCREEN_TITLES[fo["name"]]
+            continue
+        tpl_cands = [_clean_title(tpls[t]["preview"]) for t in fo["tpls"]]
+        btn_cands = [_clean_title(buttons[b]["label"]) for b in fo["btns"] if b in buttons]
+        non_back_btns = [c for c in btn_cands if "رجوع" not in c and "الغاء" not in c]
+        raw_candidates = tpl_cands + non_back_btns + btn_cands
+        candidates = [c for c in raw_candidates if _meaningful(c)]
+        title = next((c[:34] for c in candidates if c and not c.startswith("🔘")), None)
+        if not title:
+            title = next((c[:34] for c in candidates if c), None)
+        if not title:
+            title = re.sub(r"^(cb_|hndl_|show_|do_)", "", fo["name"]).replace("_", " ").strip().capitalize() or fo["name"]
+        fo["title"] = title
+
+    # تفادي تكرار نفس العنوان لأكثر من شاشة مختلفة
+    seen_titles = {}
+    for fid, fo in sorted(funcs.items(), key=lambda kv: kv[1]["name"]):
+        t = fo["title"]
+        if t in seen_titles:
+            seen_titles[t] += 1
+            fo["title"] = f"{t} ({seen_titles[t]})"
         else:
-            fo["title"] = fo["name"]
+            seen_titles[t] = 1
+
+    # تمييز الأزرار المتماثلة الاسم داخل نفس الشاشة (مثل أكثر من زر "رجوع")
+    for fid, fo in funcs.items():
+        label_count = {}
+        for bid in fo["btns"]:
+            if bid in buttons:
+                label_count[buttons[bid]["label"]] = label_count.get(buttons[bid]["label"], 0) + 1
+        seen_now = {}
+        for bid in fo["btns"]:
+            if bid not in buttons:
+                continue
+            lab = buttons[bid]["label"]
+            if label_count.get(lab, 0) > 1:
+                seen_now[lab] = seen_now.get(lab, 0) + 1
+                buttons[bid] = dict(buttons[bid], label=f"{lab} ({seen_now[lab]})")
+
     return {"funcs": funcs, "buttons": buttons, "bkeys": bkeys, "tpls": tpls, "groups": groups}
 
 
-_PREMIUM_SELF_FUNCS = ('cb_pbtn', 'cb_ptpl', '_do_pbtn_input', '_do_ptpl_input', 'premium_main_menu', 'cb_premium_root', '_nav_row', 'cb_backup_ui', 'cb_restore_ui_prompt', '_do_restore_ui', 'cb_backup_db', 'cb_restore_db_prompt', '_do_restore_db', 'cb_restart_project', 'cb_restart_all', 'cb_restart_host_confirm', 'cb_restart_host_go', 'cb_files_v2', 'cb_file_view', 'cb_file_download', 'cb_file_delete_confirm', 'cb_file_delete_go', 'cb_env_editor', '_do_env_save', 'cb_toggle_pause', '_paused_message', '_paused_callback')
+_PREMIUM_SELF_FUNCS = (
+    'cb_pbtn', 'cb_ptpl', '_do_pbtn_input', '_do_pgrp_input', '_do_ptpl_input',
+    'premium_main_menu', 'cb_premium_root', '_nav_row',
+    'cb_backup_ui', 'cb_restore_ui_prompt', '_do_restore_ui',
+    'cb_backup_db', 'cb_restore_db_prompt', '_do_restore_db',
+    'cb_admin_buttons', 'make_buttons_editor', 'edit_button_menu',
+    'cb_edit_btn', 'cb_chg_name', 'do_btn_name', 'cb_chg_style', 'cb_chg_row',
+    'cb_admin_ui', 'cb_ui_edit', 'do_ui_edit',
+    'cb_restart_project', 'cb_restart_all', 'cb_restart_host_confirm', 'cb_restart_host_go',
+    'cb_files_v2', 'cb_file_view', 'cb_file_download', 'cb_file_delete_confirm', 'cb_file_delete_go',
+    'cb_env_editor', '_do_env_save', 'cb_toggle_pause', '_paused_message', '_paused_callback'
+)
 
 
 def ui_scan():
@@ -1874,7 +2161,7 @@ def _nav_row(prefix, page, pages, back):
     return rows
 
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("pbtn_"))
+@bot.callback_query_handler(func=lambda c: c.data.startswith(("pbtn_", "pgrp_")))
 def cb_pbtn(call):
     if not is_admin(call.from_user.id):
         return
@@ -1883,27 +2170,26 @@ def cb_pbtn(call):
     act = parts[0]
     sc = ui_scan()
 
-    if act == "pbtn_root":
+    if act == "pbtn_root" or act.startswith("pbtn_root_"):
         screens = [(fid, fo) for fid, fo in sc["funcs"].items() if fo["btns"] and fo["name"] not in _PREMIUM_SELF_FUNCS]
         screens.sort(key=lambda x: (x[1]["admin"], x[1]["title"]))
-        page = int(parts[1]) if len(parts) > 1 else 0
+        page = int(parts[1]) if len(parts) > 1 else (int(act.split("_")[2]) if act.startswith("pbtn_root_") else 0)
         pages = max(1, (len(screens) + PER_PAGE - 1) // PER_PAGE)
         page = max(0, min(page, pages - 1))
         rows = []
         for fid, fo in screens[page * PER_PAGE:(page + 1) * PER_PAGE]:
-            tag = "👑" if fo["admin"] else "👤"
-            rows.append([btn_blue(f"{tag} {fo['title']} ({len(fo['btns'])})", f"pbtn_scr_{fid}_0")])
+            rows.append([btn_blue(f"🗂 {fo['title']} ({len(fo['btns'])})"[:48], f"pbtn_scr_{fid}_0")])
         rows.append([btn_green(f"🔁 أزرار متكررة ({len(sc['groups'])})", "pbtn_grp_0")])
         rows += _nav_row("pbtn_root", page, pages, "admin_premium")
         txt = (f"{make_header('🎛 تخصيص الأزرار')}\n\n"
-               "اختر شاشة فتظهر أزرارها بترتيبها الحقيقي، أو افتح «أزرار متكررة» لتخصيص أزرار تتكرر بأماكن كثيرة "
-               "(مثل حذف/تخطي/السابق) دفعة واحدة.\n\n"
+               "اختر شاشة فتظهر أزرارها مرتبة كما في البوت تماماً، أو افتح «أزرار متكررة» لتخصيص أزرار تتكرر بأماكن كثيرة "
+               "(مثل حذف/رجوع/السجلات) دفعة واحدة.\n\n"
                f"صفحة {page+1}/{pages}")
         m = types.InlineKeyboardMarkup(row_width=1)
         for r in rows: m.row(*r)
 
-    elif act.startswith("pbtn_grp_"):
-        page = int(act.split("_")[2])
+    elif act == "pbtn_grp" or act.startswith("pbtn_grp_"):
+        page = int(parts[1]) if len(parts) > 1 else int(act.split("_")[2])
         keys = sorted(sc["groups"].keys())
         pages = max(1, (len(keys) + PER_PAGE - 1) // PER_PAGE)
         page = max(0, min(page, pages - 1))
@@ -1912,7 +2198,7 @@ def cb_pbtn(call):
             g = sc["groups"][k]
             mark = "✨" if k in _btn_cache else "▫️"
             rows.append([btn_blue(f"{mark} {g['label']} (×{g['count']})"[:42], f"pgrp_e_{_ui_id(k)}")])
-        rows += _nav_row("pbtn_grp", page, pages, "pbtn_root_0")
+        rows += _nav_row("pbtn_grp", page, pages, "pbtn_root:0")
         txt = (f"{make_header('🔁 أزرار متكررة')}\n\n"
                "هذه أزرار تتكرر بأكثر من مكان (مثل حذف/تالي/سابق). تخصيصها هنا (إيموجي ولون فقط) "
                f"يطبَّق على كل نسخها دفعة واحدة — صفحة {page+1}/{pages}")
@@ -1920,23 +2206,38 @@ def cb_pbtn(call):
         for r in rows: m.row(*r)
 
     elif act.startswith("pbtn_scr_"):
-        _, fid, page = parts[0].split("_", 2)[-1], parts[0].rsplit("_", 2)[1], int(parts[0].rsplit("_", 1)[1])
-        fid = parts[0].split("_")[2]
-        page = int(parts[0].split("_")[3])
+        seg = parts[0].split("_")
+        fid = seg[2]
+        page = int(parts[1]) if len(parts) > 1 else (int(seg[3]) if len(seg) > 3 else 0)
         fo = sc["funcs"].get(fid)
         if not fo:
             return cb_premium_root(call)
-        pages = max(1, (len(fo["btns"]) + PER_PAGE - 1) // PER_PAGE)
+        # ترتيب الأزرار بنفس صفوف الشاشة الحقيقية
+        placed_rows = []
+        used_bids = set()
+        for r in fo.get("rows", []):
+            row_btns = [bid for bid in r if bid in sc["buttons"] and bid not in used_bids]
+            if row_btns:
+                placed_rows.append(row_btns)
+                used_bids.update(row_btns)
+        for bid in fo["btns"]:
+            if bid in sc["buttons"] and bid not in used_bids:
+                placed_rows.append([bid])
+                used_bids.add(bid)
+        pages = max(1, (len(placed_rows) + PER_PAGE - 1) // PER_PAGE)
         page = max(0, min(page, pages - 1))
         rows = []
-        for bid in fo["btns"][page * PER_PAGE:(page + 1) * PER_PAGE]:
-            b = sc["buttons"][bid]
-            mark = "✨" if b["key"] in _btn_cache else "▫️"
-            rows.append([btn_blue(f"{mark} {b['label']}"[:42], f"pbtn_e_{bid}")])
+        for r_bids in placed_rows[page * PER_PAGE:(page + 1) * PER_PAGE]:
+            ui_row = []
+            for bid in r_bids:
+                b = sc["buttons"][bid]
+                mark = "✨" if b["key"] in _btn_cache else "▫️"
+                ui_row.append(btn_blue(f"{mark} {b['label']}"[:32], f"pbtn_e_{bid}"))
+            rows.append(ui_row)
         rows.append([btn_green("⚡ تعيين دفعي لإيموجيات الشاشة", f"pbtn_batch_{fid}")])
-        rows += _nav_row(f"pbtn_scr_{fid}", page, pages, "pbtn_root_0")
-        txt = f"{make_header('🎛 ' + fo['title'])}\n\nاضغط أي زر لتخصيصه — صفحة {page+1}/{pages}"
-        m = types.InlineKeyboardMarkup(row_width=1)
+        rows += _nav_row(f"pbtn_scr_{fid}", page, pages, "pbtn_root:0")
+        txt = f"{make_header('🎛 ' + fo['title'])}\n\nتصفّح أزرار الشاشة واضغط أي زر لتغيير اسمه أو لونه أو إيموجيّه — صفحة {page+1}/{pages}"
+        m = types.InlineKeyboardMarkup(row_width=2)
         for r in rows: m.row(*r)
 
     elif act.startswith("pbtn_e_"):
@@ -2044,14 +2345,15 @@ def cb_pbtn(call):
         return
 
     elif act.startswith(("pbtn_i_", "pbtn_n_", "pbtn_q_", "pbtn_batch_")):
-        bid_or_fid = call.data.split("_", 2)[2]
-        user_states[uid] = f"waiting_{act}_{bid_or_fid}"
+        prefix = next(p for p in ("pbtn_i_", "pbtn_n_", "pbtn_q_", "pbtn_batch_") if act.startswith(p))
+        bid_or_fid = call.data[len(prefix):]
+        user_states[uid] = f"waiting_{prefix}{bid_or_fid}"
         hint = {
             "pbtn_i_": "أرسل الآن إيموجي مميز (ستريكر إيموجي) ليصبح أيقونة هذا الزر.",
             "pbtn_n_": "أرسل الاسم الجديد (حتى 30 حرفاً)، أو أرسل - لإرجاع الاسم الأصلي.",
             "pbtn_q_": "أرسل إيموجي مميز مع اسم بنفس الرسالة، مثال: 🔥 شراء مكتبة",
             "pbtn_batch_": "أرسل رسالة واحدة فيها إيموجيات مميزة بنفس عدد أزرار الشاشة، بالترتيب.",
-        }[act + "_" if not act.endswith("_") else act]
+        }[prefix]
         back = f"pbtn_e_{bid_or_fid}" if not act.startswith("pbtn_batch_") else f"pbtn_scr_{bid_or_fid}_0"
         m = types.InlineKeyboardMarkup()
         m.add(btn_red("❌ الغاء", back))
@@ -2185,8 +2487,7 @@ def cb_ptpl(call):
         page = max(0, min(page, pages - 1))
         m = types.InlineKeyboardMarkup(row_width=1)
         for fid, fo in screens[page * PER_PAGE:(page + 1) * PER_PAGE]:
-            tag = "👑" if fo["admin"] else "👤"
-            m.add(btn_blue(f"{tag} {fo['title']} ({len(fo['tpls'])})", f"ptpl_scr_{fid}_0"))
+            m.add(btn_blue(f"🗂 {fo['title']} ({len(fo['tpls'])})"[:48], f"ptpl_scr_{fid}_0"))
         for r in _nav_row("ptpl_root", page, pages, "admin_premium"):
             m.row(*r)
         txt = f"{make_header('📝 اختر شاشة')}\n\nصفحة {page+1}/{pages}"
@@ -2218,7 +2519,7 @@ def cb_ptpl(call):
         txt = (
             f"{make_header('📝 نص قابل للنسخ')}\n\n"
             f"🔑 المعرّفات (لا تغيّرها): <code>{legend}</code>\n\n"
-            f"<pre>{shown}</pre>\n\n👆 انسخه وعدّل عليه ثم أرسله."
+            f"<pre>{html.escape(shown)}</pre>\n\n👆 انسخه وعدّل عليه ثم أرسله."
         )
         m = types.InlineKeyboardMarkup(row_width=2)
         m.row(btn_green("✏️ تعديل", f"ptpl_e_{tid}"))
@@ -2321,36 +2622,54 @@ def export_customization():
 
 def import_customization(data):
     if not isinstance(data, dict) or data.get("version") != 1:
-        raise ValueError("bad file")
-    nb = 0
+        raise ValueError("ملف التخصيص غير صالح (version مفقود أو غير مدعوم)")
+    for req_k in ("buttons", "templates", "ui"):
+        if req_k in data and not isinstance(data[req_k], dict):
+            raise ValueError(f"صيغة الحقل {req_k} غير صالحة")
+    if "buttons_main" in data and not isinstance(data["buttons_main"], dict):
+        raise ValueError("صيغة الحقل buttons_main غير صالحة")
+    if not any(k in data for k in ("buttons", "templates", "ui", "buttons_main")):
+        raise ValueError("الملف لا يحتوي على أي بيانات تخصيص")
+
+    # التحقق الكامل قبل تعديل قاعدة البيانات
+    clean_btns = []
     for k, c in (data.get("buttons") or {}).items():
         if isinstance(k, str) and isinstance(c, dict):
             icon = c.get("icon") if isinstance(c.get("icon"), str) and re.fullmatch(r"\d{5,}", c.get("icon") or "") else None
             label = c.get("label") if isinstance(c.get("label"), str) and len(c["label"]) <= 40 else None
             style = c.get("style") if c.get("style") in BTN_STYLES else None
             if icon or label or style:
-                set_btn_custom(k, icon=icon, label=label, style=style); nb += 1
-    nt = 0
+                clean_btns.append((k, icon, label, style))
+
+    clean_tpls = []
     for tid, text in (data.get("templates") or {}).items():
-        if isinstance(tid, str) and re.fullmatch(r"[0-9a-f]{10}", tid) and isinstance(text, str) and len(text) <= 3500:
-            with DB_LOCK:
-                conn = _conn(); c = conn.cursor()
-                c.execute("REPLACE INTO tpl_custom (tid, text) VALUES (?, ?)", (tid, text))
-                conn.commit(); conn.close()
-            nt += 1
-    _load_tpl_cache()
-    nu = 0
+        if isinstance(tid, str) and re.fullmatch(r"[0-9a-f]{10}", tid) and isinstance(text, str) and 0 < len(text) <= 3500:
+            clean_tpls.append((tid, text))
+
+    clean_ui = []
     for k, v in (data.get("ui") or {}).items():
         if isinstance(k, str) and isinstance(v, str) and len(v) <= 3000:
-            set_ui(k, v); nu += 1
-    nm = 0
+            clean_ui.append((k, v))
+
+    clean_main = []
     for k, v in (data.get("buttons_main") or {}).items():
         if k in DEFAULT_BUTTONS and isinstance(v, list) and len(v) == 3:
-            try:
-                set_button(k, str(v[0])[:60], v[1] if v[1] in BTN_STYLES + (None,) else None, int(v[2]))
-                nm += 1
-            except Exception:
-                pass
+            clean_main.append((k, str(v[0])[:60], v[1] if v[1] in BTN_STYLES + (None, "") else None, int(v[2])))
+
+    nb = nt = nu = nm = 0
+    for k, icon, label, style in clean_btns:
+        set_btn_custom(k, icon=icon, label=label, style=style); nb += 1
+    for tid, text in clean_tpls:
+        with DB_LOCK:
+            conn = _conn(); c = conn.cursor()
+            c.execute("REPLACE INTO tpl_custom (tid, text) VALUES (?, ?)", (tid, text))
+            conn.commit(); conn.close()
+        nt += 1
+    _load_tpl_cache()
+    for k, v in clean_ui:
+        set_ui(k, v); nu += 1
+    for k, name_v, style_v, row_v in clean_main:
+        set_button(k, name_v, style_v, row_v); nm += 1
     return nb, nt, nu, nm
 
 
@@ -2809,6 +3128,7 @@ def main_menu(uid):
         "btn_new_project": "new_proj",
         "btn_account": "my_account",
         "btn_help": "help",
+        "btn_wallet": "wallet_menu",
         "btn_support": "contact_support",
     }
 
@@ -2842,10 +3162,27 @@ def cmd_start(msg):
                         parse_mode="HTML")
         return
 
-    if not get_user(uid):
+    is_new_user = not get_user(uid)
+    if is_new_user:
         add_user(uid, msg.from_user.username or "",
                 msg.from_user.first_name or "")
+        if is_paid_mode():
+            set_max_projects(uid, int(float(get_ui("free_trial_projects") or 1)))
         log_action(uid, "register")
+        # التحقق من رابط الإحالة /start ref_123456
+        parts = (msg.text or "").split(maxsplit=1)
+        if len(parts) > 1 and parts[1].startswith("ref_"):
+            try:
+                ref_uid = int(parts[1][4:])
+                bonus = register_referral(uid, ref_uid)
+                if bonus:
+                    cur = get_ui("currency_name") or "$"
+                    try:
+                        bot.send_message(ref_uid, f"🎉 انضم مستخدم جديد عبر رابط إحالتك! تمت إضافة <code>{bonus} {cur}</code> إلى رصيدك.", parse_mode="HTML")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
     name = msg.from_user.first_name or "صديقي"
     ui = get_all_ui()
@@ -3542,6 +3879,26 @@ def cb_new(call):
 
     ok, count, limit = check_user_limit(uid)
     if not ok:
+        if is_paid_mode():
+            cur = get_ui("currency_name") or "$"
+            bal = get_balance(uid)
+            sp = get_ui("slot_price") or "2.0"
+            txt_lim = (
+                f"{make_header('💎 الترقية أو شراء خانة مشروع')}\n\n"
+                f"📦 <b>مشاريعك الحالية:</b> <code>{count}/{limit}</code>\n"
+                f"💳 <b>رصيدك:</b> <code>{bal:.2f} {cur}</code>\n"
+                f"🏷 <b>سعر الخانة الإضافية:</b> <code>{sp} {cur}</code>\n\n"
+                "اشترِ خانة إضافية أو اشحن رصيدك أو ادعُ أصدقاءك للحصول على رصيد مجاني:"
+            )
+            mlim = types.InlineKeyboardMarkup(row_width=1)
+            mlim.add(btn_green(f"🛒 شراء خانة مشروع ({sp} {cur})", "shop_buy_slot"))
+            mlim.row(btn_blue("💳 شحن الرصيد", "wallet_recharge"), btn_blue("🤝 دعوة أصدقاء", "referral_menu"))
+            mlim.add(btn_gray("🔙 رجوع", "main_menu"))
+            try:
+                bot.edit_message_text(txt_lim, call.message.chat.id, call.message.message_id, reply_markup=mlim, parse_mode="HTML")
+            except Exception:
+                bot.send_message(call.message.chat.id, txt_lim, reply_markup=mlim, parse_mode="HTML")
+            return
         bot.answer_callback_query(call.id,
                                  f"⚠️ وصلت الحد الاقصى ({count}/{limit})",
                                  show_alert=True)
@@ -3943,6 +4300,82 @@ def cb_upload_req(call):
 # ============================================================
 # التثبيت المتدرج
 # ============================================================
+@bot.callback_query_handler(func=lambda c: c.data.startswith("smart_"))
+def cb_smart(call):
+    uid = call.from_user.id
+    try:
+        pid = int(call.data[6:])
+    except Exception:
+        return
+    p = get_project(pid)
+    if not p or not can_access_project(p, uid):
+        bot.answer_callback_query(call.id, "🚫 غير مصرح", show_alert=True)
+        return
+
+    entry_path = os.path.join(p[4], p[5])
+    detected = []
+    if p[5].endswith(".py") and os.path.exists(entry_path):
+        try:
+            detected = resolve_required_pkgs(entry_path)
+        except Exception:
+            detected = []
+    for line in (p[7] or "").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and line not in detected:
+            detected.append(line)
+
+    if not detected:
+        bot.answer_callback_query(call.id, "✅ لا توجد مكتبات خارجية مطلوبة لهذا المشروع", show_alert=True)
+        return
+
+    bot.answer_callback_query(call.id, f"🪄 بدء التثبيت الذكي ({len(detected)} مكتبة)")
+    init_items = [(f"<code>{pkg}</code> <i>(في الانتظار)</i>", False) for pkg in detected]
+    try:
+        bot.edit_message_text(
+            render_progress(f"🪄 التثبيت الذكي — {p[2]}", "✅", "⏳", init_items,
+                            footer="🧪 <i>جاري تجهيز البيئة المعزولة (.venv)...</i>"),
+            call.message.chat.id, call.message.message_id, parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
+    def do_smart():
+        ensure_venv(p[4])
+        items = []
+        ok_n = fail_n = 0
+        for i, pkg in enumerate(detected, 1):
+            cur_items = list(items) + [(f"<code>{pkg}</code> <b>(جاري التثبيت...)</b>", False)]
+            try:
+                bot.edit_message_text(
+                    render_progress(f"🪄 التثبيت الذكي ({i}/{len(detected)})", "✅", "⚙️", cur_items,
+                                    footer="🛡️ <i>تثبيت معزول خاص بهذا المشروع فقط</i>"),
+                    call.message.chat.id, call.message.message_id, parse_mode="HTML"
+                )
+            except Exception:
+                pass
+            ok, res_msg = pip_install_in(p[4], pkg)
+            if ok:
+                ok_n += 1
+                items.append((res_msg, True))
+            else:
+                fail_n += 1
+                items.append((res_msg, False))
+
+        update_project(pid, requirements="\n".join(detected), installed=1)
+        footer = f"✅ نجح: <code>{ok_n}</code> · ❌ فشل: <code>{fail_n}</code> · 🛡️ البيئة: <code>معزولة</code>"
+        final_txt = render_progress(f"🪄 نتيجة التثبيت الذكي — {p[2]}", "✅", "❌", items, footer=footer)
+        m = types.InlineKeyboardMarkup(row_width=2)
+        m.add(btn_green("▶️ تشغيل المشروع", f"start_{pid}"))
+        m.row(btn_blue("📄 السجلات", f"logs_{pid}"), btn_gray("🔙 رجوع", f"proj_{pid}"))
+        try:
+            bot.edit_message_text(final_txt, call.message.chat.id, call.message.message_id, reply_markup=m, parse_mode="HTML")
+        except Exception:
+            bot.send_message(call.message.chat.id, final_txt, reply_markup=m, parse_mode="HTML")
+        log_action(uid, "smart_install", f"pid={pid} ok={ok_n} fail={fail_n}")
+
+    threading.Thread(target=do_smart, daemon=True).start()
+
+
 @bot.callback_query_handler(func=lambda c: c.data.startswith("install_"))
 def cb_install(call):
     uid = call.from_user.id
@@ -3984,11 +4417,14 @@ def cb_install(call):
         success_count = 0
         fail_count = 0
 
+        prog_items = []
         for i, pkg in enumerate(lines, 1):
-            progress = f"⚙️ [{i}/{len(lines)}] جاري تثبيت:\n<code>{pkg}</code>"
+            cur_view = list(prog_items) + [(f"<code>{pkg}</code> <b>(جاري التثبيت...)</b>", False)]
             try:
-                bot.edit_message_text(progress, call.message.chat.id,
-                                     call.message.message_id, parse_mode="HTML")
+                bot.edit_message_text(
+                    render_progress(f"⚙️ تثبيت المتطلبات ({i}/{len(lines)})", "✅", "⏳", cur_view),
+                    call.message.chat.id, call.message.message_id, parse_mode="HTML"
+                )
             except:
                 pass
 
@@ -3997,9 +4433,11 @@ def cb_install(call):
             if ok:
                 success_count += 1
                 results.append(f"✅ {m}")
+                prog_items.append((m, True))
             else:
                 fail_count += 1
                 results.append(f"❌ {m}")
+                prog_items.append((m, False))
 
         update_project(pid, installed=1)
 
@@ -4129,7 +4567,9 @@ def cb_admin(call):
     m.row(btn_blue("👥 المستخدمين", "admin_users"), btn_blue("📦 المشاريع", "admin_projs"))
     m.row(btn_blue("🔗 Tunnel", "admin_tunnel"), btn_blue("📥 تخزين المطوّر", "admin_storage_0"))
     m.row(btn_blue("📋 سجل الاحداث", "admin_logs"), btn_green("🔓 فك حظر", "admin_unban"))
+    mode_lbl = "💰 الوضع: مدفوع 💎" if is_paid_mode() else "🆓 الوضع: مجاني"
     m.row(btn_green("🎨 تخصيص البوت (أزرار + نصوص + نسخ)", "admin_premium"))
+    m.row(btn_blue(f"💳 إدارة المدفوعات والباقات ({mode_lbl})", "admin_billing"))
     m.row(btn_blue("💽 نسخة DB كاملة", "admin_backup_db"), btn_blue("📥 استعادة DB كاملة", "admin_restore_db"))
     m.row(btn_blue("🔁 إعادة تشغيل الكل", "admin_restart_all"), btn_red("♻️ إعادة تشغيل الاستضافة", "admin_restart_host"))
     m.row(btn(f"{'▶️ تشغيل الاستضافة' if host_paused() else '⏸ إيقاف الاستضافة'}", "admin_toggle_pause",
@@ -4290,7 +4730,7 @@ def cb_admin_ui(call):
     m = types.InlineKeyboardMarkup(row_width=1)
     for key, label in UI_TEMPLATES.items():
         m.add(btn_blue(f"📝 {label}", f"ui_edit_{key}"))
-    m.add(btn_gray("🔙 رجوع", "admin_panel"))
+    m.add(btn_gray("🔙 رجوع", "admin_premium"))
 
     try:
         bot.edit_message_text(txt, call.message.chat.id, call.message.message_id,
@@ -4310,7 +4750,7 @@ def cb_ui_edit(call):
 
     txt = (
         f"<b>✏️ تعديل:</b> <code>{key}</code>\n\n"
-        f"📄 القيمة الحالية:\n<pre>{current}</pre>\n\n"
+        f"📄 القيمة الحالية:\n<pre>{html.escape(current)}</pre>\n\n"
         "📤 ارسل القيمة الجديدة (يدعم الإيموجي المميز والتنسيق):"
     )
 
@@ -4639,6 +5079,360 @@ def do_broadcast(msg):
 
 
 # ============================================================
+# 💳 المحفظة + الشحن + الإحالات + الباقات (نظام المجاني / المدفوع)
+# ============================================================
+@bot.callback_query_handler(func=lambda c: c.data == "wallet_menu")
+def cb_wallet(call):
+    uid = call.from_user.id
+    if not get_user(uid):
+        add_user(uid, call.from_user.username or "", call.from_user.first_name or "")
+    u = get_user(uid)
+    cur = get_ui("currency_name") or "$"
+    bal = get_balance(uid)
+    count = count_user_projects(uid)
+    limit = get_max_projects(uid)
+    refs = u[11] if u and len(u) > 11 and u[11] else 0
+    mode_txt = "💎 مدفوع (شحن / باقات)" if is_paid_mode() else "🆓 مجاني مفتوح"
+    badge = "⭐ VIP" if is_premium(uid) else "👤 عادي"
+
+    txt = (
+        f"{make_header('💳 محفظتي والشحن')}\n\n"
+        f"⚙️ <b>وضع البوت:</b> {mode_txt}\n"
+        f"🏷 <b>حسابك:</b> {badge}\n"
+        f"💰 <b>الرصيد الحالي:</b> <code>{bal:.2f} {cur}</code>\n"
+        f"📦 <b>خانات المشاريع:</b> <code>{count}/{limit}</code>\n"
+        f"🤝 <b>عدد إحالاتك:</b> <code>{refs}</code>\n"
+    )
+    m = types.InlineKeyboardMarkup(row_width=2)
+    m.row(btn_green("💳 شحن الرصيد", "wallet_recharge"), btn_blue("🎟 كود شحن", "wallet_redeem"))
+    m.row(btn_blue("🛒 متجر الباقات", "shop_menu"), btn_green("🤝 نظام الإحالة", "referral_menu"))
+    m.add(btn_gray("🔙 رجوع", "main_menu"))
+    try:
+        bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=m, parse_mode="HTML")
+    except Exception:
+        bot.send_message(call.message.chat.id, txt, reply_markup=m, parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "wallet_recharge")
+def cb_wallet_recharge(call):
+    uid = call.from_user.id
+    user_states[uid] = "waiting_recharge_amount"
+    info = get_ui("recharge_info")
+    cur = get_ui("currency_name") or "$"
+    txt = (
+        f"{make_header('💳 شحن الرصيد')}\n\n"
+        f"{info}\n\n"
+        f"📤 أرسل الآن المبلغ الذي تريد شحنه (بـ {cur})، مثال: <code>5</code>"
+    )
+    m = types.InlineKeyboardMarkup()
+    m.add(btn_red("❌ إلغاء", "wallet_menu"))
+    bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=m, parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "waiting_recharge_amount")
+def do_recharge_amount(msg):
+    uid = msg.from_user.id
+    try:
+        amt = float((msg.text or "").strip().replace(",", "."))
+        if amt <= 0 or amt > 100000:
+            raise ValueError()
+    except Exception:
+        bot.reply_to(msg, "❌ أرسل رقماً صحيحاً أكبر من 0.")
+        return
+    user_states[uid] = f"waiting_recharge_proof_{amt}"
+    m = types.InlineKeyboardMarkup()
+    m.add(btn_red("❌ إلغاء", "wallet_menu"))
+    bot.reply_to(msg, "📸 أرسل الآن إثبات الدفع (رقم الحوالة/المعاملة أو لقطة الشاشة):", reply_markup=m)
+
+
+@bot.message_handler(func=lambda m: user_states.get(m.from_user.id, "").startswith("waiting_recharge_proof_"),
+                     content_types=['text', 'photo', 'document'])
+def do_recharge_proof(msg):
+    uid = msg.from_user.id
+    amt = float(user_states.pop(uid)[len("waiting_recharge_proof_"):])
+    proof = (msg.text or msg.caption or "مرفق إثبات دفع").strip()[:400]
+    rid = create_recharge_request(uid, amt, proof)
+    cur = get_ui("currency_name") or "$"
+
+    adm_txt = (
+        f"{make_header('💳 طلب شحن جديد')}\n\n"
+        f"🆔 <b>الطلب:</b> <code>#{rid}</code>\n"
+        f"👤 <b>المستخدم:</b> <code>{uid}</code> (@{msg.from_user.username or 'None'})\n"
+        f"💰 <b>المبلغ:</b> <code>{amt:.2f} {cur}</code>\n"
+        f"📝 <b>الإثبات:</b> {html.escape(proof)}"
+    )
+    am = types.InlineKeyboardMarkup(row_width=2)
+    am.row(btn_green("✅ قبول الشحن", f"adm_rech_ok_{rid}"), btn_red("❌ رفض", f"adm_rech_no_{rid}"))
+    for aid in ADMIN_IDS:
+        try:
+            if msg.photo:
+                bot.send_photo(aid, msg.photo[-1].file_id, caption=adm_txt, parse_mode="HTML", reply_markup=am)
+            else:
+                bot.send_message(aid, adm_txt, parse_mode="HTML", reply_markup=am)
+        except Exception:
+            pass
+    bot.reply_to(msg, f"✅ تم إرسال طلب الشحن <code>#{rid}</code> بمبلغ <code>{amt:.2f} {cur}</code> للمراجعة.", parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "wallet_redeem")
+def cb_wallet_redeem(call):
+    user_states[call.from_user.id] = "waiting_gift_code"
+    m = types.InlineKeyboardMarkup()
+    m.add(btn_red("❌ إلغاء", "wallet_menu"))
+    bot.edit_message_text(f"{make_header('🎟 استخدام كود شحن')}\n\nأرسل الكود الآن:",
+                          call.message.chat.id, call.message.message_id, reply_markup=m, parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "waiting_gift_code")
+def do_redeem_code(msg):
+    uid = msg.from_user.id
+    user_states.pop(uid, None)
+    ok, res = redeem_gift_code(uid, msg.text or "")
+    cur = get_ui("currency_name") or "$"
+    if ok:
+        bot.reply_to(msg, f"🎉 تم شحن <code>{res:.2f} {cur}</code> إلى محفظتك!\n💳 رصيدك: <code>{get_balance(uid):.2f} {cur}</code>", parse_mode="HTML")
+    else:
+        bot.reply_to(msg, res)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "shop_menu")
+def cb_shop(call):
+    uid = call.from_user.id
+    cur = get_ui("currency_name") or "$"
+    bal = get_balance(uid)
+    sp = float(get_ui("slot_price") or 2.0)
+    vp = float(get_ui("vip_price") or 5.0)
+    txt = (
+        f"{make_header('🛒 متجر الباقات')}\n\n"
+        f"💳 <b>رصيدك:</b> <code>{bal:.2f} {cur}</code>\n\n"
+        f"1️⃣ <b>خانة مشروع إضافية (+1):</b> <code>{sp:.2f} {cur}</code>\n"
+        f"2️⃣ <b>ترقية VIP (+5 مشاريع + شارة ⭐):</b> <code>{vp:.2f} {cur}</code>"
+    )
+    m = types.InlineKeyboardMarkup(row_width=1)
+    m.add(btn_green(f"📦 شراء خانة مشروع ({sp:.2f} {cur})", "shop_buy_slot"))
+    m.add(btn_blue(f"⭐ ترقية VIP ({vp:.2f} {cur})", "shop_buy_vip"))
+    m.add(btn_gray("🔙 رجوع", "wallet_menu"))
+    bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=m, parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda c: c.data in ("shop_buy_slot", "shop_buy_vip"))
+def cb_shop_buy(call):
+    uid = call.from_user.id
+    cur = get_ui("currency_name") or "$"
+    bal = get_balance(uid)
+    if call.data == "shop_buy_slot":
+        price = float(get_ui("slot_price") or 2.0)
+        if bal < price:
+            bot.answer_callback_query(call.id, f"❌ رصيدك غير كافٍ ({bal:.2f}/{price:.2f} {cur})", show_alert=True)
+            return
+        add_balance(uid, -price)
+        add_max_projects(uid, 1)
+        log_action(uid, "buy_slot", f"price={price}")
+        bot.answer_callback_query(call.id, "✅ تم شراء خانة مشروع إضافية!", show_alert=True)
+    else:
+        price = float(get_ui("vip_price") or 5.0)
+        if bal < price:
+            bot.answer_callback_query(call.id, f"❌ رصيدك غير كافٍ ({bal:.2f}/{price:.2f} {cur})", show_alert=True)
+            return
+        add_balance(uid, -price)
+        add_max_projects(uid, 5)
+        with DB_LOCK:
+            conn = _conn(); c = conn.cursor()
+            c.execute("UPDATE users SET is_premium=1 WHERE user_id=?", (uid,))
+            conn.commit(); conn.close()
+        log_action(uid, "buy_vip", f"price={price}")
+        bot.answer_callback_query(call.id, "⭐ مبروك! تمت ترقيتك إلى VIP (+5 مشاريع)", show_alert=True)
+    cb_wallet(call)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "referral_menu")
+def cb_referral(call):
+    uid = call.from_user.id
+    u = get_user(uid)
+    refs = u[11] if u and len(u) > 11 and u[11] else 0
+    bonus = get_ui("referral_bonus") or "0.5"
+    cur = get_ui("currency_name") or "$"
+    try:
+        bot_user = bot.get_me().username
+    except Exception:
+        bot_user = "HostBot"
+    ref_link = f"https://t.me/{bot_user}?start=ref_{uid}"
+    txt = (
+        f"{make_header('🤝 نظام الإحالة')}\n\n"
+        f"🎁 <b>المكافأة لكل صديق:</b> <code>{bonus} {cur}</code>\n"
+        f"👥 <b>إجمالي إحالاتك:</b> <code>{refs}</code>\n\n"
+        f"🔗 <b>رابط إحالتك الخاص:</b>\n<code>{ref_link}</code>"
+    )
+    m = types.InlineKeyboardMarkup()
+    m.add(btn_blue("📤 مشاركة الرابط", url=f"https://t.me/share/url?url={ref_link}"))
+    m.add(btn_gray("🔙 رجوع", "wallet_menu"))
+    bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=m, parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "admin_billing")
+def cb_admin_billing(call):
+    if not is_admin(call.from_user.id):
+        return
+    paid = is_paid_mode()
+    cur = get_ui("currency_name") or "$"
+    pending = get_pending_recharges()
+    txt = (
+        f"{make_header('💰 إدارة المدفوعات والباقات')}\n\n"
+        f"⚙️ <b>الوضع الحالي:</b> {'💎 مدفوع' if paid else '🆓 مجاني'}\n"
+        f"📦 <b>سعر الخانة:</b> <code>{get_ui('slot_price')} {cur}</code> · ⭐ <b>VIP:</b> <code>{get_ui('vip_price')} {cur}</code>\n"
+        f"🤝 <b>مكافأة الإحالة:</b> <code>{get_ui('referral_bonus')} {cur}</code>\n"
+        f"🎁 <b>مشاريع مجانية للمبتدئ:</b> <code>{get_ui('free_trial_projects')}</code>\n"
+        f"⏳ <b>طلبات شحن معلقة:</b> <code>{len(pending)}</code>"
+    )
+    m = types.InlineKeyboardMarkup(row_width=2)
+    m.add(btn("🔄 تبديل إلى: " + ("🆓 وضع مجاني" if paid else "💎 وضع مدفوع"),
+              "adm_toggle_mode", style="success" if paid else "danger"))
+    m.row(btn_blue(f"⏳ طلبات الشحن ({len(pending)})", "adm_recharges"), btn_green("🎟 إنشاء كود شحن", "adm_new_code"))
+    m.row(btn_blue("💳 تعديل رصيد مستخدم", "adm_add_bal"), btn_blue("⚙️ تعديل الأسعار والمكافآت", "adm_prices"))
+    m.add(btn_gray("🔙 رجوع", "admin_panel"))
+    try:
+        bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=m, parse_mode="HTML")
+    except Exception:
+        bot.send_message(call.message.chat.id, txt, reply_markup=m, parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "adm_toggle_mode")
+def cb_adm_toggle_mode(call):
+    if not is_admin(call.from_user.id):
+        return
+    new_mode = "free" if is_paid_mode() else "paid"
+    set_ui("bot_mode", new_mode)
+    bot.answer_callback_query(call.id, f"✅ تم التحويل إلى: {'💎 مدفوع' if new_mode == 'paid' else '🆓 مجاني'}", show_alert=True)
+    cb_admin_billing(call)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "adm_recharges")
+def cb_adm_recharges(call):
+    if not is_admin(call.from_user.id):
+        return
+    reqs = get_pending_recharges()
+    cur = get_ui("currency_name") or "$"
+    m = types.InlineKeyboardMarkup(row_width=2)
+    if not reqs:
+        txt = f"{make_header('⏳ طلبات الشحن')}\n\n📭 لا توجد طلبات معلقة."
+    else:
+        lines = [make_header(f"⏳ طلبات الشحن ({len(reqs)})"), ""]
+        for r in reqs[:8]:
+            rid, uid, amt, proof, _, ts = r
+            lines.append(f"• <b>#{rid}</b> | <code>{uid}</code> | <code>{amt:.2f} {cur}</code>\n  {html.escape(proof[:50])}")
+            m.row(btn_green(f"✅ قبول #{rid}", f"adm_rech_ok_{rid}"), btn_red(f"❌ رفض #{rid}", f"adm_rech_no_{rid}"))
+        txt = "\n".join(lines)
+    m.add(btn_gray("🔙 رجوع", "admin_billing"))
+    bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=m, parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith(("adm_rech_ok_", "adm_rech_no_")))
+def cb_adm_rech_action(call):
+    if not is_admin(call.from_user.id):
+        return
+    approve = call.data.startswith("adm_rech_ok_")
+    rid = int(call.data.rsplit("_", 1)[1])
+    req = get_recharge_request(rid)
+    if not req or not resolve_recharge_request(rid, "approved" if approve else "rejected"):
+        bot.answer_callback_query(call.id, "⚠️ الطلب معالَج مسبقاً أو غير موجود", show_alert=True)
+        return
+    _, uid, amt, _, _, _ = req
+    cur = get_ui("currency_name") or "$"
+    if approve:
+        add_balance(uid, amt)
+        bot.answer_callback_query(call.id, f"✅ تم قبول #{rid} وإضافة {amt:.2f} {cur}")
+        try:
+            bot.send_message(uid, f"✅ تم قبول طلب الشحن <code>#{rid}</code>! أُضيف <code>{amt:.2f} {cur}</code> لرصيدك.", parse_mode="HTML")
+        except Exception:
+            pass
+    else:
+        bot.answer_callback_query(call.id, f"❌ تم رفض #{rid}")
+        try:
+            bot.send_message(uid, f"❌ تم رفض طلب الشحن <code>#{rid}</code>.", parse_mode="HTML")
+        except Exception:
+            pass
+    cb_adm_recharges(call)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "adm_new_code")
+def cb_adm_new_code(call):
+    if not is_admin(call.from_user.id):
+        return
+    user_states[call.from_user.id] = "waiting_adm_code"
+    m = types.InlineKeyboardMarkup()
+    m.add(btn_red("❌ إلغاء", "admin_billing"))
+    bot.edit_message_text(f"{make_header('🎟 إنشاء كود شحن')}\n\nأرسل المبلغ وعدد الاستخدامات (مثال: <code>5 10</code>):",
+                          call.message.chat.id, call.message.message_id, reply_markup=m, parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "waiting_adm_code")
+def do_adm_new_code(msg):
+    if not is_admin(msg.from_user.id):
+        return
+    user_states.pop(msg.from_user.id, None)
+    parts = (msg.text or "").split()
+    try:
+        amt = float(parts[0])
+        uses = int(parts[1]) if len(parts) > 1 else 1
+    except Exception:
+        bot.reply_to(msg, "❌ صيغة غير صحيحة. مثال: <code>5 1</code>", parse_mode="HTML")
+        return
+    code_str = "HOST-" + secrets.token_hex(4).upper()
+    create_gift_code(code_str, amt, uses)
+    cur = get_ui("currency_name") or "$"
+    bot.reply_to(msg, f"✅ تم إنشاء الكود:\n<code>{code_str}</code>\n💰 القيمة: <code>{amt:.2f} {cur}</code> · 🔢 الاستخدامات: <code>{uses}</code>", parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "adm_add_bal")
+def cb_adm_add_bal(call):
+    if not is_admin(call.from_user.id):
+        return
+    user_states[call.from_user.id] = "waiting_adm_bal"
+    m = types.InlineKeyboardMarkup()
+    m.add(btn_red("❌ إلغاء", "admin_billing"))
+    bot.edit_message_text(f"{make_header('💳 تعديل رصيد مستخدم')}\n\nأرسل <code>USER_ID المبلغ</code> (مثال: <code>123456789 10</code>):",
+                          call.message.chat.id, call.message.message_id, reply_markup=m, parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "waiting_adm_bal")
+def do_adm_add_bal(msg):
+    if not is_admin(msg.from_user.id):
+        return
+    user_states.pop(msg.from_user.id, None)
+    parts = (msg.text or "").split()
+    try:
+        t_uid, amt = int(parts[0]), float(parts[1])
+    except Exception:
+        bot.reply_to(msg, "❌ صيغة غير صحيحة.")
+        return
+    if not get_user(t_uid):
+        bot.reply_to(msg, "❌ المستخدم غير موجود.")
+        return
+    add_balance(t_uid, amt)
+    cur = get_ui("currency_name") or "$"
+    bot.reply_to(msg, f"✅ تم تعديل رصيد <code>{t_uid}</code> بمقدار <code>{amt:+.2f} {cur}</code>.", parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "adm_prices")
+def cb_adm_prices(call):
+    if not is_admin(call.from_user.id):
+        return
+    m = types.InlineKeyboardMarkup(row_width=1)
+    for k, lbl in [
+        ("slot_price", "📦 سعر الخانة الإضافية"),
+        ("vip_price", "⭐ سعر ترقية VIP"),
+        ("referral_bonus", "🤝 مكافأة الإحالة"),
+        ("free_trial_projects", "🎁 المشاريع المجانية في الوضع المدفوع"),
+        ("currency_name", "💱 رمز/اسم العملة"),
+        ("recharge_info", "📝 تعليمات وطرق الشحن"),
+    ]:
+        m.add(btn_blue(f"{lbl}: {get_ui(k)[:20]}", f"ui_edit_{k}"))
+    m.add(btn_gray("🔙 رجوع", "admin_billing"))
+    bot.edit_message_text(f"{make_header('⚙️ أسعار الباقات والإحالة')}", call.message.chat.id, call.message.message_id,
+                          reply_markup=m, parse_mode="HTML")
+
+
+# ============================================================
 # Flask + Web Dashboard
 # ============================================================
 web = Flask(__name__)
@@ -4715,231 +5509,165 @@ WEB_HTML = """
 <title>{{ title }}</title>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <style>
-* { margin:0; padding:0; box-sizing:border-box; font-family: system-ui, sans-serif; }
-body { background:#0a0f1e; color:#e2e8f0; min-height:100vh; padding:20px; position:relative; overflow-x:hidden; }
-.bg-svg { position:fixed; top:0; left:0; width:100%; height:100%; z-index:-1; opacity:0.4; }
-.container { max-width:1100px; margin:0 auto; position:relative; z-index:1; }
-.header { display:flex; align-items:center; justify-content:center; gap:15px; margin-bottom:30px; }
-.header .logo { width:50px; height:50px; }
-h1 { font-size:2em; color:#60a5fa; font-weight:600; }
-.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:15px; margin-bottom:25px; }
-.card { background:#1e293b; border:1px solid #334155; border-radius:12px; padding:20px; text-align:center; transition:transform 0.2s; }
+* { margin:0; padding:0; box-sizing:border-box; font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; }
+body { background:#060a14; color:#e2e8f0; min-height:100vh; padding:22px; position:relative; overflow-x:hidden; }
+.bg-svg { position:fixed; inset:0; width:100%; height:100%; z-index:-1; pointer-events:none; }
+.container { max-width:1160px; margin:0 auto; position:relative; z-index:1; }
+.topbar { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:14px; background:rgba(15,23,42,0.75); backdrop-filter:blur(14px); border:1px solid rgba(96,165,250,0.2); border-radius:18px; padding:16px 22px; margin-bottom:22px; box-shadow:0 10px 35px rgba(0,0,0,0.35); }
+.brand { display:flex; align-items:center; gap:14px; }
+.brand h1 { font-size:1.55em; background:linear-gradient(135deg,#60a5fa,#a78bfa,#34d399); -webkit-background-clip:text; -webkit-text-fill-color:transparent; font-weight:800; }
+.pill-row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
+.pill { background:rgba(30,41,59,0.9); border:1px solid #334155; padding:7px 14px; border-radius:999px; font-size:0.85em; display:inline-flex; align-items:center; gap:7px; color:#cbd5e1; }
+.pill strong { color:#38bdf8; }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:16px; margin-bottom:22px; }
+.card { background:linear-gradient(160deg,rgba(30,41,59,0.88),rgba(15,23,42,0.92)); border:1px solid rgba(148,163,184,0.16); border-radius:16px; padding:20px; display:flex; align-items:center; justify-content:space-between; transition:transform .2s,border-color .2s; }
 .card:hover { transform:translateY(-3px); border-color:#60a5fa; }
-.card .icon-svg { width:32px; height:32px; margin-bottom:10px; }
-.card .num { font-size:2em; font-weight:700; color:#60a5fa; }
-.card .lbl { color:#94a3b8; margin-top:6px; font-size:0.9em; }
-.prj { background:#1e293b; border:1px solid #334155; border-radius:12px; padding:20px; margin-bottom:15px; transition:border-color 0.2s; }
-.prj:hover { border-color:#60a5fa; }
-.prj-header { display:flex; align-items:center; gap:10px; margin-bottom:12px; }
-.prj-header .icon-svg { width:24px; height:24px; }
-.prj h3 { color:#60a5fa; font-size:1.1em; margin:0; }
-.row { display:flex; justify-content:space-between; padding:5px 0; color:#cbd5e1; font-size:0.9em; align-items:center; }
-.row .icon-svg { width:16px; height:16px; margin-left:6px; vertical-align:middle; }
-.badge { padding:3px 12px; border-radius:12px; font-size:0.8em; font-weight:600; display:inline-flex; align-items:center; gap:5px; }
-.badge svg { width:12px; height:12px; }
-.badge.run { background:#166534; color:#86efac; }
-.badge.stop { background:#7f1d1d; color:#fca5a5; }
-.actions { margin-top:15px; display:flex; gap:8px; flex-wrap:wrap; }
-.btn { padding:8px 16px; border:none; border-radius:8px; text-decoration:none; color:#fff; font-weight:500; font-size:0.85em; cursor:pointer; display:inline-flex; align-items:center; gap:6px; transition:opacity 0.2s; }
-.btn svg { width:14px; height:14px; }
-.btn:hover { opacity:0.85; }
-.btn-s { background:#16a34a; }
-.btn-x { background:#dc2626; }
-.btn-l { background:#2563eb; }
-.btn-p { background:#7c3aed; }
-.empty { text-align:center; color:#64748b; padding:80px 20px; font-size:1.1em; }
-.empty svg { width:80px; height:80px; margin-bottom:20px; opacity:0.4; }
+.card .num { font-size:2em; font-weight:800; color:#60a5fa; line-height:1.1; }
+.card .lbl { color:#94a3b8; font-size:0.88em; margin-top:4px; }
+.toolbar { display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px; margin-bottom:18px; }
+.search-box { flex:1; min-width:220px; position:relative; }
+.search-box input { width:100%; background:rgba(15,23,42,0.85); border:1px solid #334155; color:#f1f5f9; padding:11px 16px; border-radius:12px; font-size:0.95em; outline:none; }
+.search-box input:focus { border-color:#60a5fa; }
+.filters { display:flex; gap:8px; flex-wrap:wrap; }
+.fbtn { background:#1e293b; color:#cbd5e1; border:1px solid #334155; padding:8px 15px; border-radius:10px; cursor:pointer; font-size:0.85em; font-weight:600; transition:.2s; }
+.fbtn.active, .fbtn:hover { background:#2563eb; border-color:#3b82f6; color:#fff; }
+.cards-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(330px,1fr)); gap:16px; }
+.prj { background:rgba(15,23,42,0.85); backdrop-filter:blur(10px); border:1px solid rgba(148,163,184,0.18); border-radius:16px; padding:20px; display:flex; flex-direction:column; gap:12px; transition:transform .2s,border-color .2s; }
+.prj:hover { transform:translateY(-2px); border-color:#60a5fa; }
+.prj-head { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+.prj-title { display:flex; align-items:center; gap:10px; }
+.prj-title h3 { color:#f8fafc; font-size:1.1em; }
+.badge { padding:4px 12px; border-radius:999px; font-size:0.78em; font-weight:700; display:inline-flex; align-items:center; gap:6px; }
+.badge.run { background:rgba(22,163,74,0.2); color:#4ade80; border:1px solid rgba(74,222,128,0.35); }
+.badge.stop { background:rgba(220,38,38,0.2); color:#f87171; border:1px solid rgba(248,113,113,0.35); }
+.dot { width:8px; height:8px; border-radius:50%; background:currentColor; }
+.meta { display:flex; flex-direction:column; gap:6px; font-size:0.88em; color:#cbd5e1; background:rgba(30,41,59,0.45); padding:12px; border-radius:10px; }
+.meta-row { display:flex; justify-content:space-between; gap:8px; align-items:center; }
+.meta-row code { color:#93c5fd; background:rgba(37,99,235,0.15); padding:2px 7px; border-radius:6px; }
+.actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:auto; }
+.btn { padding:8px 14px; border:none; border-radius:9px; text-decoration:none; color:#fff; font-weight:600; font-size:0.83em; cursor:pointer; display:inline-flex; align-items:center; gap:6px; transition:opacity .2s; }
+.btn:hover { opacity:.86; }
+.btn-s { background:#16a34a; } .btn-x { background:#dc2626; } .btn-l { background:#2563eb; } .btn-p { background:#7c3aed; }
+.empty { text-align:center; color:#64748b; padding:70px 20px; grid-column:1/-1; }
 </style>
 </head>
 <body>
-
-<svg class="bg-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 800" preserveAspectRatio="xMidYMid slice">
+<svg class="bg-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 900" preserveAspectRatio="xMidYMid slice">
   <defs>
-    <radialGradient id="g1" cx="20%" cy="20%">
-      <stop offset="0%" stop-color="#1e40af" stop-opacity="0.3"/>
-      <stop offset="100%" stop-color="#1e40af" stop-opacity="0"/>
-    </radialGradient>
-    <radialGradient id="g2" cx="80%" cy="80%">
-      <stop offset="0%" stop-color="#7c3aed" stop-opacity="0.3"/>
-      <stop offset="100%" stop-color="#7c3aed" stop-opacity="0"/>
-    </radialGradient>
+    <radialGradient id="orb1" cx="15%" cy="15%" r="45%"><stop offset="0%" stop-color="#2563eb" stop-opacity="0.28"/><stop offset="100%" stop-color="#060a14" stop-opacity="0"/></radialGradient>
+    <radialGradient id="orb2" cx="85%" cy="80%" r="45%"><stop offset="0%" stop-color="#7c3aed" stop-opacity="0.26"/><stop offset="100%" stop-color="#060a14" stop-opacity="0"/></radialGradient>
+    <pattern id="grid" width="48" height="48" patternUnits="userSpaceOnUse"><path d="M 48 0 L 0 0 0 48" fill="none" stroke="#1e293b" stroke-width="0.8" opacity="0.5"/></pattern>
   </defs>
-  <rect width="100%" height="100%" fill="url(#g1)"/>
-  <rect width="100%" height="100%" fill="url(#g2)"/>
-  <circle cx="200" cy="150" r="2" fill="#60a5fa" opacity="0.5"/>
-  <circle cx="400" cy="300" r="1.5" fill="#60a5fa" opacity="0.4"/>
-  <circle cx="700" cy="100" r="2" fill="#a78bfa" opacity="0.5"/>
-  <circle cx="900" cy="400" r="1.5" fill="#60a5fa" opacity="0.4"/>
-  <circle cx="1100" cy="250" r="2" fill="#a78bfa" opacity="0.5"/>
-  <circle cx="300" cy="600" r="1.5" fill="#60a5fa" opacity="0.3"/>
-  <circle cx="800" cy="700" r="2" fill="#a78bfa" opacity="0.4"/>
-  <circle cx="1050" cy="600" r="1.5" fill="#60a5fa" opacity="0.3"/>
+  <rect width="100%" height="100%" fill="url(#grid)"/>
+  <rect width="100%" height="100%" fill="url(#orb1)"/>
+  <rect width="100%" height="100%" fill="url(#orb2)"/>
+  <path d="M0,780 Q360,700 720,760 T1440,720 L1440,900 L0,900 Z" fill="#0f172a" opacity="0.55"/>
 </svg>
 
 <div class="container">
-
-  <div class="header">
-    <svg class="logo" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#60a5fa" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M12 2L2 7l10 5 10-5-10-5z"/>
-      <path d="M2 17l10 5 10-5"/>
-      <path d="M2 12l10 5 10-5"/>
-    </svg>
-    <h1>{{ title }}</h1>
+  <div class="topbar">
+    <div class="brand">
+      <svg width="44" height="44" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <rect x="3" y="3" width="42" height="42" rx="12" fill="url(#lg1)" fill-opacity="0.18" stroke="#60a5fa" stroke-width="2"/>
+        <defs><linearGradient id="lg1" x1="0" y1="0" x2="48" y2="48"><stop stop-color="#3b82f6"/><stop offset="1" stop-color="#a855f7"/></linearGradient></defs>
+        <path d="M24 11L12 18L24 25L36 18L24 11Z" stroke="#60a5fa" stroke-width="2" stroke-linejoin="round"/>
+        <path d="M12 24L24 31L36 24" stroke="#a78bfa" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M12 30L24 37L36 30" stroke="#34d399" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <div>
+        <h1>{{ title }}</h1>
+        <div style="font-size:0.8em;color:#94a3b8">لوحة الاستضافة الذكية</div>
+      </div>
+    </div>
+    <div class="pill-row">
+      <span class="pill">💳 الرصيد: <strong>{{ balance }} {{ currency }}</strong></span>
+      <span class="pill">⚙️ الوضع: <strong>{{ 'مدفوع 💎' if paid_mode else 'مجاني 🆓' }}</strong></span>
+      <span class="pill">🤝 الإحالات: <strong>{{ referrals }}</strong></span>
+    </div>
   </div>
 
   <div class="grid">
     <div class="card">
-      <svg class="icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#60a5fa" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
-      </svg>
-      <div class="num">{{ total }}</div>
-      <div class="lbl">المشاريع</div>
+      <div><div class="num">{{ total }}</div><div class="lbl">إجمالي المشاريع</div></div>
+      <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#60a5fa" stroke-width="1.8"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
     </div>
-
     <div class="card">
-      <svg class="icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#22c55e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
-        <polyline points="22 4 12 14.01 9 11.01"/>
+      <div><div class="num" style="color:#4ade80">{{ running }}</div><div class="lbl">شغالة الآن</div></div>
+      <svg width="48" height="48" viewBox="0 0 48 48">
+        <circle cx="24" cy="24" r="19" fill="none" stroke="#1e293b" stroke-width="5"/>
+        <circle cx="24" cy="24" r="19" fill="none" stroke="#22c55e" stroke-width="5" stroke-dasharray="{{ (119 * running // (total if total else 1)) }} 119" stroke-linecap="round" transform="rotate(-90 24 24)"/>
       </svg>
-      <div class="num" style="color:#22c55e">{{ running }}</div>
-      <div class="lbl">شغالة</div>
     </div>
-
     <div class="card">
-      <svg class="icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <circle cx="12" cy="12" r="10"/>
-        <line x1="15" y1="9" x2="9" y2="15"/>
-        <line x1="9" y1="9" x2="15" y2="15"/>
-      </svg>
-      <div class="num" style="color:#ef4444">{{ stopped }}</div>
-      <div class="lbl">موقوفة</div>
+      <div><div class="num" style="color:#f87171">{{ stopped }}</div><div class="lbl">متوقفة</div></div>
+      <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="1.8"><circle cx="12" cy="12" r="10"/><rect x="9" y="9" width="6" height="6" rx="1"/></svg>
     </div>
   </div>
 
+  <div class="toolbar">
+    <div class="search-box"><input id="q" type="text" placeholder="🔍 ابحث عن مشروع..." oninput="filterCards()"></div>
+    <div class="filters">
+      <button class="fbtn active" onclick="setFilter('all', this)">الكل</button>
+      <button class="fbtn" onclick="setFilter('run', this)">🟢 شغالة</button>
+      <button class="fbtn" onclick="setFilter('stop', this)">🔴 متوقفة</button>
+    </div>
+  </div>
+
+  <div class="cards-grid" id="cards">
   {% if projects %}
     {% for p in projects %}
-    <div class="prj">
-      <div class="prj-header">
-        {% if p[3] == 'bot' %}
-        <svg class="icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#60a5fa" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <rect x="3" y="11" width="18" height="10" rx="2"/>
-          <circle cx="12" cy="5" r="2"/>
-          <path d="M12 7v4"/>
-        </svg>
-        {% else %}
-        <svg class="icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#a78bfa" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <circle cx="12" cy="12" r="10"/>
-          <line x1="2" y1="12" x2="22" y2="12"/>
-          <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
-        </svg>
-        {% endif %}
-        <h3>{{ p[2] }}</h3>
-      </div>
-
-      <div class="row">
-        <span>
-          <svg class="icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-            <polyline points="14 2 14 8 20 8"/>
-          </svg>
-          الملف:
-        </span>
-        <span><code>{{ p[5] }}</code></span>
-      </div>
-
-      {% if p[12] %}
-      <div class="row">
-        <span>
-          <svg class="icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
-            <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
-          </svg>
-          الرابط:
-        </span>
-        <span><a href="{{ p[12] }}" target="_blank" style="color:#60a5fa">{{ p[12] }}</a></span>
-      </div>
-      {% endif %}
-
-      <div class="row">
-        <span>
-          <svg class="icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <circle cx="12" cy="12" r="10"/>
-            <polyline points="12 6 12 12 16 14"/>
-          </svg>
-          المدة:
-        </span>
-        <span>{{ uptime(p[16]) if running_map[p[0]] else '—' }}</span>
-      </div>
-
-      <div class="row">
-        <span>
-          <svg class="icon-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M22 12h-4l-3 9L9 3l-3 9H2"/>
-          </svg>
-          الحالة:
-        </span>
-        <span class="badge {{ 'run' if running_map[p[0]] else 'stop' }}">
-          {% if running_map[p[0]] %}
-          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
-            <polyline points="20 6 9 17 4 12"/>
-          </svg>
-          شغال
+    <div class="prj" data-name="{{ p[2]|lower }}" data-state="{{ 'run' if running_map[p[0]] else 'stop' }}">
+      <div class="prj-head">
+        <div class="prj-title">
+          {% if p[3] == 'bot' %}
+          <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#60a5fa" stroke-width="2"><rect x="3" y="10" width="18" height="10" rx="3"/><circle cx="12" cy="4" r="2"/><path d="M12 6v4"/><circle cx="9" cy="15" r="1" fill="#60a5fa"/><circle cx="15" cy="15" r="1" fill="#60a5fa"/></svg>
+          {% elif p[3] == 'web' %}
+          <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#a78bfa" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15 15 0 0 1 0 20M12 2a15 15 0 0 0 0 20"/></svg>
           {% else %}
-          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
-            <line x1="18" y1="6" x2="6" y2="18"/>
-            <line x1="6" y1="6" x2="18" y2="18"/>
-          </svg>
-          موقوف
+          <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#34d399" stroke-width="2"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
           {% endif %}
-        </span>
+          <h3>{{ p[2] }}</h3>
+        </div>
+        <span class="badge {{ 'run' if running_map[p[0]] else 'stop' }}"><span class="dot"></span>{{ 'شغال' if running_map[p[0]] else 'متوقف' }}</span>
       </div>
-
+      <div class="meta">
+        <div class="meta-row"><span>الملف الرئيسي</span><code>{{ p[5] }}</code></div>
+        <div class="meta-row"><span>مدة التشغيل</span><span>{{ uptime(p[16]) if running_map[p[0]] else '—' }}</span></div>
+        {% if p[12] %}<div class="meta-row"><span>الرابط</span><a href="{{ p[12] }}" target="_blank" style="color:#60a5fa;text-decoration:none">فتح ↗</a></div>{% endif %}
+      </div>
       <div class="actions">
-        <a href="/start/{{ p[0] }}?token={{ token }}" class="btn btn-s">
-          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
-            <polygon points="5 3 19 12 5 21 5 3"/>
-          </svg>
-          تشغيل
-        </a>
-        <a href="/stop/{{ p[0] }}?token={{ token }}" class="btn btn-x">
-          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor">
-            <rect x="6" y="6" width="12" height="12"/>
-          </svg>
-          ايقاف
-        </a>
-        <a href="/logs/{{ p[0] }}?token={{ token }}" class="btn btn-l">
-          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <line x1="8" y1="6" x2="21" y2="6"/>
-            <line x1="8" y1="12" x2="21" y2="12"/>
-            <line x1="8" y1="18" x2="21" y2="18"/>
-            <line x1="3" y1="6" x2="3.01" y2="6"/>
-            <line x1="3" y1="12" x2="3.01" y2="12"/>
-            <line x1="3" y1="18" x2="3.01" y2="18"/>
-          </svg>
-          السجلات
-        </a>
-        {% if p[3] == 'web' and p[12] %}
-        <a href="{{ p[12] }}" target="_blank" class="btn btn-p">
-          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
-            <polyline points="15 3 21 3 21 9"/>
-            <line x1="10" y1="14" x2="21" y2="3"/>
-          </svg>
-          فتح الموقع
-        </a>
-        {% endif %}
+        <a href="/start/{{ p[0] }}?token={{ token }}" class="btn btn-s">▶ تشغيل</a>
+        <a href="/stop/{{ p[0] }}?token={{ token }}" class="btn btn-x">⏹ إيقاف</a>
+        <a href="/logs/{{ p[0] }}?token={{ token }}" class="btn btn-l">📄 السجلات</a>
+        {% if p[3] == 'web' and p[12] %}<a href="{{ p[12] }}" target="_blank" class="btn btn-p">🌐 الموقع</a>{% endif %}
       </div>
     </div>
     {% endfor %}
   {% else %}
     <div class="empty">
-      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#64748b" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
-      </svg>
-      <div>لا توجد مشاريع بعد</div>
+      <svg width="84" height="84" viewBox="0 0 24 24" fill="none" stroke="#475569" stroke-width="1.4"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+      <div style="margin-top:12px">لا توجد مشاريع بعد — أنشئ مشروعك الأول من البوت</div>
     </div>
   {% endif %}
+  </div>
 </div>
+<script>
+let curFilter = 'all';
+function setFilter(f, el){
+  curFilter = f;
+  document.querySelectorAll('.fbtn').forEach(b=>b.classList.remove('active'));
+  el.classList.add('active');
+  filterCards();
+}
+function filterCards(){
+  const q = (document.getElementById('q').value || '').toLowerCase();
+  document.querySelectorAll('#cards .prj').forEach(c=>{
+    const okName = c.dataset.name.includes(q);
+    const okState = curFilter === 'all' || c.dataset.state === curFilter;
+    c.style.display = (okName && okState) ? 'flex' : 'none';
+  });
+}
+</script>
 </body>
 </html>
 """
@@ -4962,13 +5690,19 @@ def home():
     running_map = {p[0]: is_running(p[0]) for p in projs}
     running = sum(1 for v in running_map.values() if v)
 
+    u = get_user(uid)
+    refs = u[11] if u and len(u) > 11 and u[11] else 0
     return render_template_string(
         WEB_HTML,
         title=get_ui("dashboard_title"),
         projects=projs, total=len(projs),
         running=running, stopped=len(projs) - running,
         running_map=running_map, uptime=calc_uptime,
-        token=token
+        token=token,
+        balance=f"{get_balance(uid):.2f}",
+        currency=get_ui("currency_name") or "$",
+        paid_mode=is_paid_mode(),
+        referrals=refs
     )
 
 
