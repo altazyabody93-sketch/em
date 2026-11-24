@@ -1655,7 +1655,7 @@ def btn(text, cb=None, url=None, style=None):
     key = cb if cb else (f"url:{url}" if url else f"txt:{text}")
     cust, is_exact = _lookup_btn_cfg(key)
     if cust:
-        if is_exact and cust.get("label"):
+        if cust.get("label"):
             text = cust["label"]
         if cust.get("icon"):
             text = _strip_lead(text)
@@ -1953,12 +1953,20 @@ def _scan_source(src):
     groups = {}
     _self_prefixes = ("pbtn_", "pgrp_", "ptpl_", "admin_premium", "admin_backup_ui", "admin_restore_ui", "admin_backup_db", "admin_restore_db", "admin_buttons", "edit_btn_", "chg_name_", "chg_style_", "chg_row_")
     for fn, key, label in v.buttons:
-        if key.startswith(_self_prefixes) or fn in _PREMIUM_SELF_FUNCS:
+        if key.startswith(_self_prefixes) or fn in _PREMIUM_SELF_FUNCS or fn.startswith(("_dx", "cb_dx", "cmd_dx")):
             continue
         if "*" in key:
             glabel = _derive_clean_label(label, key, fn)
             g = groups.setdefault(key, {"key": key, "label": glabel, "count": 0})
             g["count"] += 1
+            # Add pattern button to its screen too so every screen shows all its buttons
+            bid = _ui_id(key, 8)
+            fid, fo = fobj(fn)
+            if bid not in buttons:
+                buttons[bid] = {"key": key, "label": glabel, "fid": fid}
+                bkeys[key] = bid
+            if bid not in fo["btns"]:
+                fo["btns"].append(bid)
             continue
         bid = _ui_id(key, 8)
         fid, fo = fobj(fn)
@@ -1967,6 +1975,34 @@ def _scan_source(src):
             bkeys[key] = bid
         if bid not in fo["btns"]:
             fo["btns"].append(bid)
+
+    # Ensure all main_menu buttons are registered in exact order
+    _mm_fid, _mm_fo = fobj("main_menu")
+    _mm_defs = [
+        ("btn_dashboard", "🌐 لوحة التحكم"),
+        ("my_projs", "📦 مشاريعي"),
+        ("new_proj", "➕ مشروع جديد"),
+        ("my_account", "👤 حسابي"),
+        ("help", "❓ مساعدة"),
+        ("wallet_menu", "💳 محفظتي والشحن"),
+        ("contact_support", "💬 تواصل مع الدعم"),
+        ("admin_panel", "👑 لوحة المطور"),
+    ]
+    _mm_rows = [
+        ["btn_dashboard"],
+        ["my_projs", "new_proj"],
+        ["my_account", "help"],
+        ["wallet_menu", "contact_support"],
+        ["admin_panel"],
+    ]
+    for _mk, _ml in _mm_defs:
+        _mbid = _ui_id(_mk, 8)
+        if _mbid not in buttons:
+            buttons[_mbid] = {"key": _mk, "label": _ml, "fid": _mm_fid}
+            bkeys[_mk] = _mbid
+        if _mbid not in _mm_fo["btns"]:
+            _mm_fo["btns"].append(_mbid)
+    _mm_fo["rows"] = [[bkeys[k] for k in r if k in bkeys] for r in _mm_rows]
     for fn, keys in v.rows:
         fo = fobj(fn)[1]
         row = [bkeys[k] for k in keys if k in bkeys]
@@ -2032,6 +2068,17 @@ def _scan_source(src):
         "cb_shop": "🛒 متجر الباقات",
         "cb_referral": "🤝 نظام الإحالة",
         "cb_admin_billing": "💰 إدارة المدفوعات والباقات",
+        "cb_adm_recharges": "⏳ طلبات الشحن",
+        "cb_adm_prices": "⚙️ أسعار الباقات والإحالة",
+        "cb_adm_new_code": "🎟 إنشاء كود شحن",
+        "cb_adm_add_bal": "💳 تعديل رصيد مستخدم",
+        "cb_admin_demo_web": "🌐 ويب المراقبة (OK)",
+        "cb_admin_bot_name": "✏️ تغيير اسم البوت",
+        "cb_admin_bot_photo": "🖼 تغيير صورة البوت",
+        "cb_pull": "📤 سحب ملفات المستخدمين",
+        "cb_wallet_recharge": "💳 شحن الرصيد",
+        "cb_wallet_redeem": "🎟 استخدام كود شحن",
+        "cb_admin_storage": "📥 تخزين المطوّر",
     }
 
     def _meaningful(c):
@@ -2093,7 +2140,9 @@ _PREMIUM_SELF_FUNCS = (
     'cb_admin_ui', 'cb_ui_edit', 'do_ui_edit',
     'cb_restart_project', 'cb_restart_all', 'cb_restart_host_confirm', 'cb_restart_host_go',
     'cb_files_v2', 'cb_file_view', 'cb_file_download', 'cb_file_delete_confirm', 'cb_file_delete_go',
-    'cb_env_editor', '_do_env_save', 'cb_toggle_pause', '_paused_message', '_paused_callback'
+    'cb_env_editor', '_do_env_save', 'cb_toggle_pause', '_paused_message', '_paused_callback',
+    'cb_dx_actions', 'cb_dx_intercept', 'cb_dx_toggle', 'cmd_dx_edit', '_do_dx_input',
+    '_dx_on_message', '_dx_editor_markup', '_dx_attach_page_btn'
 )
 
 
@@ -2167,14 +2216,68 @@ def apply_cosmetics(text):
 _orig_send_message = bot.send_message
 _orig_edit_message_text = bot.edit_message_text
 _orig_reply_to = bot.reply_to
+_DX_MSG_PAGE = {}
+
+
+def _match_msg_tpl(raw_text):
+    if not isinstance(raw_text, str) or not raw_text:
+        return None, None
+    try:
+        sc = ui_scan()
+        for tid, info in sc["tpls"].items():
+            fn_name = sc["funcs"].get(info["fid"], {}).get("name", "")
+            if fn_name in _PREMIUM_SELF_FUNCS or fn_name.startswith(("_dx", "cb_dx", "cmd_dx")):
+                continue
+            rx = _tpl_rx_cache.get(tid)
+            if rx is None:
+                rx = _tpl_rx_cache[tid] = _tpl_regex(info["parts"])
+            if rx[0].match(raw_text):
+                return tid, info["fid"]
+    except Exception:
+        pass
+    return None, None
+
+
+def _dx_attach_page_btn(chat_id, raw_text, k):
+    if chat_id not in _DX_ON or not isinstance(raw_text, str):
+        return None, None
+    tid, fid = _match_msg_tpl(raw_text)
+    if not tid and not fid:
+        return None, None
+    rm = k.get("reply_markup")
+    if isinstance(rm, types.InlineKeyboardMarkup):
+        try:
+            has_dx = any(
+                (getattr(b, "callback_data", "") or "").startswith(("dx", "ptpl_", "pbtn_", "pgrp_", "admin_premium"))
+                for row in rm.keyboard for b in row
+            )
+            if not has_dx:
+                new_rm = types.InlineKeyboardMarkup(row_width=rm.row_width)
+                new_rm.keyboard = [list(r) for r in rm.keyboard]
+                cb_val = f"dxptpl_{tid}" if tid else f"dxpscr_{fid}"
+                new_rm.add(_orig_btn("📝 تعديل نص هذه الصفحة", cb=cb_val, style="primary"))
+                k["reply_markup"] = new_rm
+        except Exception:
+            pass
+    return tid, fid
 
 
 def _send_message(chat_id, text, *a, **k):
-    return _orig_send_message(chat_id, apply_cosmetics(text), *a, **k)
+    tid, fid = _dx_attach_page_btn(chat_id, text, k)
+    res = _orig_send_message(chat_id, apply_cosmetics(text), *a, **k)
+    if (tid or fid) and res and getattr(res, "message_id", None):
+        _DX_MSG_PAGE[(chat_id, res.message_id)] = (tid, fid)
+    return res
 
 
 def _edit_message_text(text, *a, **k):
-    return _orig_edit_message_text(apply_cosmetics(text), *a, **k)
+    chat_id = k.get("chat_id") or (a[0] if len(a) > 0 else None)
+    tid, fid = _dx_attach_page_btn(chat_id, text, k)
+    res = _orig_edit_message_text(apply_cosmetics(text), *a, **k)
+    msg_id = k.get("message_id") or (a[1] if len(a) > 1 else None)
+    if (tid or fid) and chat_id and msg_id:
+        _DX_MSG_PAGE[(chat_id, msg_id)] = (tid, fid)
+    return res
 
 
 def _reply_to(message, text, *a, **k):
@@ -2380,7 +2483,10 @@ def cb_pbtn(call):
                 mark = "✨" if b["key"] in _btn_cache else "▫️"
                 ui_row.append(btn_blue(f"{mark} {b['label']}"[:32], f"pbtn_e_{bid}"))
             rows.append(ui_row)
-        rows.append([btn_green("⚡ تعيين دفعي لإيموجيات الشاشة", f"pbtn_batch_{fid}")])
+        if fo.get("tpls"):
+            rows.append([btn_green("⚡ تعيين دفعي لإيموجيات الشاشة", f"pbtn_batch_{fid}"), btn_blue("📝 نصوص هذه الشاشة", f"ptpl_scr_{fid}_0")])
+        else:
+            rows.append([btn_green("⚡ تعيين دفعي لإيموجيات الشاشة", f"pbtn_batch_{fid}")])
         rows += _nav_row(f"pbtn_scr_{fid}", page, pages, "pbtn_root:0")
         txt = f"{make_header('🎛 ' + fo['title'])}\n\nتصفّح أزرار الشاشة واضغط أي زر لتغيير اسمه أو لونه أو إيموجيّه — صفحة {page+1}/{pages}"
         m = types.InlineKeyboardMarkup(row_width=2)
@@ -2626,6 +2732,7 @@ def cb_ptpl(call):
     sc = ui_scan()
 
     if data.startswith("ptpl_root"):
+        _DX_PTPL_BACK.pop(uid, None)
         page = int(data.split(":")[1]) if ":" in data else 0
         screens = [(fid, fo) for fid, fo in sc["funcs"].items() if fo["tpls"] and fo["name"] not in _PREMIUM_SELF_FUNCS]
         screens.sort(key=lambda x: (x[1]["admin"], x[1]["title"]))
@@ -2651,7 +2758,10 @@ def cb_ptpl(call):
         for tid in fo["tpls"][page * PER_PAGE:(page + 1) * PER_PAGE]:
             mark = "✨" if tid in _tpl_cache else "▫️"
             m.add(btn_blue(f"{mark} {sc['tpls'][tid]['preview']}"[:42], f"ptpl_v_{tid}"))
-        for r in _nav_row(f"ptpl_scr_{fid}", page, pages, "ptpl_root:0"):
+        if fo.get("btns"):
+            m.add(btn_green("🎛 أزرار هذه الشاشة", f"pbtn_scr_{fid}_0"))
+        _scr_back = _DX_PTPL_BACK.get(uid) or "ptpl_root:0"
+        for r in _nav_row(f"ptpl_scr_{fid}", page, pages, _scr_back):
             m.row(*r)
         txt = f"{make_header('📝 ' + fo['title'])}\n\nصفحة {page+1}/{pages}"
 
@@ -2671,7 +2781,8 @@ def cb_ptpl(call):
         m.row(btn_green("✏️ تعديل", f"ptpl_e_{tid}"))
         if tid in _tpl_cache:
             m.add(btn_red("♻️ إعادة الأصل", f"ptpl_x_{tid}"))
-        m.add(btn_gray("🔙 رجوع", f"ptpl_scr_{info['fid']}_0"))
+        _v_back = _DX_PTPL_BACK.get(uid) or f"ptpl_scr_{info['fid']}_0"
+        m.add(btn_gray("🔙 رجوع", _v_back))
 
     elif data.startswith("ptpl_e_"):
         tid = data[len("ptpl_e_"):]
@@ -3250,23 +3361,41 @@ def main_menu(uid):
 
     dashboard_url = get_dashboard_link(uid)
 
+    _dcust = _btn_cache.get("btn_dashboard", {})
+    _dname, _dstyle, _ = get_button("btn_dashboard")
+    if _dcust.get("label"):
+        _dname = _dcust["label"]
+    if _dcust.get("icon"):
+        _dname = _strip_lead(_dname)
+    if _dcust.get("style"):
+        _dstyle = None if _dcust["style"] == "none" else _dcust["style"]
     if dashboard_url.startswith("https://"):
         try:
-            name, style, _ = get_button("btn_dashboard")
             b = types.InlineKeyboardButton(
-                name,
+                _dname,
                 web_app=types.WebAppInfo(url=dashboard_url)
             )
-            if style:
+            if _dstyle:
                 try:
-                    b.style = style
+                    b.style = _dstyle
+                except:
+                    pass
+            if _dcust.get("icon"):
+                try:
+                    b.icon_custom_emoji_id = _dcust["icon"]
                 except:
                     pass
             m.add(b)
         except:
-            m.add(make_custom_btn("btn_dashboard", url=dashboard_url))
+            m.add(_orig_btn(_dname, url=dashboard_url, style=_dstyle))
     else:
-        m.add(make_custom_btn("btn_dashboard", url=dashboard_url))
+        b = _orig_btn(_dname, url=dashboard_url, style=_dstyle)
+        if _dcust.get("icon"):
+            try:
+                b.icon_custom_emoji_id = _dcust["icon"]
+            except:
+                pass
+        m.add(b)
 
     # ربط الأزرار بالـ callback الصحيح
     callbacks = {
@@ -6643,6 +6772,8 @@ _DX_ON = set()
 _DX_KEYS = {}
 _DX_LABELS = {}
 _DX_BYPASS = set()
+_DX_PTPL_BACK = {}
+_DX_ORIGIN_PAGE = {}
 _DX_SAFE = ("pbtn_", "pgrp_", "ptpl_", "dx", "admin_premium", "noop")
 
 
@@ -6652,6 +6783,26 @@ def _dx_id(key, label=""):
     if label:
         _DX_LABELS[h] = label
     return h
+
+
+def _dx_target_fid(key):
+    if not key or key.startswith(("url:", "txt:")):
+        return None
+    sc = ui_scan()
+    dummy = SimpleNamespace(data=key, from_user=SimpleNamespace(id=ADMIN_IDS[0] if ADMIN_IDS else 0))
+    for hnd in bot.callback_query_handlers:
+        fn = hnd.get("function")
+        if not fn or fn is cb_dx_intercept or fn.__name__ in _PREMIUM_SELF_FUNCS or fn.__name__.startswith(("cb_dx", "_dx")):
+            continue
+        flt = (hnd.get("filters") or {}).get("func")
+        try:
+            if flt and flt(dummy):
+                fid = _ui_id(fn.__name__, 8)
+                if fid in sc["funcs"]:
+                    return fid
+        except Exception:
+            pass
+    return None
 
 
 def _dx_editor_markup(h):
@@ -6676,8 +6827,8 @@ def _dx_editor_markup(h):
     m.row(btn_blue("✏️ الاسم", f"dxn_{h}"), btn_blue("🎨 الإيموجي", f"dxi_{h}"), btn_blue("🌈 اللون", f"dxc_{h}"))
     m.add(btn_red("♻️ إعادة الافتراضي", f"dxr_{h}"))
     m.add(btn_green("▶️ فتح الزر (تنقّل)", f"dxgo_{h}"))
-    m.add(btn_blue("📝 تخصيص نصوص الرسائل", "ptpl_root"))
-    m.add(btn_red("🔴 إنهاء التخصيص المباشر", "dx_off"))
+    m.row(btn_blue("📝 تعديل نص هذه الصفحة", f"dxtpl_{h}"), btn_gray("📚 كل النصوص", "ptpl_root"))
+    m.row(btn_gray("🔙 رجوع", f"dxback_{h}"), btn_red("🔴 إنهاء التخصيص", "dx_off"))
     return txt, m
 
 
@@ -6706,6 +6857,9 @@ def cb_dx_intercept(call):
     except Exception:
         pass
     h = _dx_id(key, label)
+    page_info = _DX_MSG_PAGE.get((call.message.chat.id, call.message.message_id))
+    if page_info:
+        _DX_ORIGIN_PAGE[h] = page_info
     try:
         bot.answer_callback_query(call.id, "🎯 وضع التخصيص")
     except Exception:
@@ -6719,7 +6873,7 @@ def _dx_on_message(uid, chat_id):
     bot.send_message(chat_id,
                      f"{make_header('🎯 التخصيص المباشر مفعّل')}\n\n"
                      "تنقّل في البوت كأنك مستخدم، واضغط <b>أي زر</b> فيظهر لك محرره (اسم · إيموجي مميز · لون) في رسالة جديدة.\n"
-                     "من المحرر اضغط «▶️ فتح الزر» لتكمل التنقّل.\n"
+                     "من المحرر اضغط «▶️ فتح الزر» لتكمل التنقّل، وفي أي صفحة تدخلها ستجد زر «📝 تعديل نص هذه الصفحة» بالأسفل.\n"
                      "للإنهاء: «🔴 إنهاء» أو أرسل /edit مرة أخرى.\n\n"
                      "ℹ️ أزرار الروابط (URL) تُفتح مباشرة ولا يمكن اعتراضها؛ خصّصها من «🎨 تخصيص البوت».",
                      parse_mode="HTML", reply_markup=main_menu(uid))
@@ -6756,6 +6910,35 @@ def cb_dx_actions(call):
     if not is_admin(uid):
         return
     d = call.data
+    chat_id, mid = call.message.chat.id, call.message.message_id
+
+    if d == "dxpclose":
+        _DX_PTPL_BACK.pop(uid, None)
+        bot.answer_callback_query(call.id)
+        try:
+            bot.delete_message(chat_id, mid)
+        except Exception:
+            bot.send_message(chat_id, "🏠 القائمة الرئيسية", reply_markup=main_menu(uid))
+        return
+
+    if d.startswith(("dxptpl_", "dxpscr_")):
+        bot.answer_callback_query(call.id)
+        sc = ui_scan()
+        _DX_PTPL_BACK[uid] = "dxpclose"
+        if d.startswith("dxptpl_"):
+            tid = d[len("dxptpl_"):]
+            target_cb = f"ptpl_v_{tid}"
+        else:
+            fid = d[len("dxpscr_"):]
+            fo = sc["funcs"].get(fid)
+            if fo and len(fo.get("tpls", [])) == 1:
+                target_cb = f"ptpl_v_{fo['tpls'][0]}"
+            else:
+                target_cb = f"ptpl_scr_{fid}_0"
+        fake_msg = _orig_send_message(chat_id, "⏳ ...")
+        fake_call = SimpleNamespace(data=target_cb, from_user=call.from_user, message=fake_msg)
+        return cb_ptpl(fake_call)
+
     act, _, rest = d.partition("_")
     if act == "dxs":
         h, _, style = rest.rpartition("_")
@@ -6799,6 +6982,33 @@ def cb_dx_actions(call):
                 "dxq": "أرسل إيموجي مميز مع الاسم في رسالة واحدة، مثال: 🔥 مشاريعي"}[act]
         m = types.InlineKeyboardMarkup().add(btn_red("❌ إلغاء", f"dxe_{h}"))
         bot.edit_message_text(f"{make_header('✏️ تخصيص')}\n\n{hint}", chat_id, mid, reply_markup=m, parse_mode="HTML")
+    elif act == "dxback":
+        bot.answer_callback_query(call.id)
+        try:
+            bot.delete_message(chat_id, mid)
+        except Exception:
+            try:
+                bot.edit_message_text("🏠 القائمة الرئيسية", chat_id, mid, reply_markup=main_menu(uid))
+            except Exception:
+                bot.send_message(chat_id, "🏠 القائمة الرئيسية", reply_markup=main_menu(uid))
+    elif act == "dxtpl":
+        bot.answer_callback_query(call.id)
+        sc = ui_scan()
+        fid = _dx_target_fid(key)
+        tid = None
+        if not fid or not sc["funcs"].get(fid, {}).get("tpls"):
+            orig_tid, orig_fid = _DX_ORIGIN_PAGE.get(h, (None, None))
+            tid = orig_tid
+            fid = orig_fid or fid
+        _DX_PTPL_BACK[uid] = f"dxe_{h}"
+        if tid:
+            call.data = f"ptpl_v_{tid}"
+        elif fid and sc["funcs"].get(fid, {}).get("tpls"):
+            tpls_list = sc["funcs"][fid]["tpls"]
+            call.data = f"ptpl_v_{tpls_list[0]}" if len(tpls_list) == 1 else f"ptpl_scr_{fid}_0"
+        else:
+            call.data = "ptpl_root"
+        return cb_ptpl(call)
     elif act == "dxgo":
         _DX_BYPASS.add((uid, key))
         call.data = key
