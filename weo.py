@@ -50,9 +50,12 @@ ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "7325566792").split(","
 DEVELOPER_USERNAME = "E_E_72"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECTS_DIR = os.path.join(BASE_DIR, "hosted_projects")
+# DATA_DIR: مجلد البيانات. على الاستضافات التي تمسح الملفات اجعله مجلداً دائماً (Volume) عبر متغير DATA_DIR
+DATA_DIR = os.environ.get("DATA_DIR", BASE_DIR)
+os.makedirs(DATA_DIR, exist_ok=True)
+PROJECTS_DIR = os.path.join(DATA_DIR, "hosted_projects")
 os.makedirs(PROJECTS_DIR, exist_ok=True)
-DB_PATH = os.path.join(BASE_DIR, "host_v12.db")
+DB_PATH = os.path.join(DATA_DIR, "host_v12.db")
 
 RUNNING = {}
 user_states = {}
@@ -778,10 +781,23 @@ def get_dashboard_link(uid):
 # ============================================================
 # تشغيل / إيقاف المشاريع
 # ============================================================
-def start_project(pid):
+START_WATCH_SECONDS = int(os.environ.get("START_WATCH_SECONDS", "20"))
+_START_PROGRESS = {}
+
+
+def _sp(pid, **kw):
+    d = _START_PROGRESS.setdefault(pid, {"notes": [], "phase": "check", "t0": time.time()})
+    note = kw.pop("note", None)
+    if note:
+        d["notes"].append(note)
+    d.update(kw)
+
+
+def _start_project_once(pid, watch=START_WATCH_SECONDS):
     p = get_project(pid)
     if not p:
         return False, "المشروع غير موجود", None
+    _sp(pid, phase="check")
 
     key = f"p{pid}"
     if key in RUNNING and RUNNING[key].poll() is None:
@@ -798,6 +814,8 @@ def start_project(pid):
 
     try:
         env = os.environ.copy()
+        _pl = os.path.join(p[4], PYLIBS_DIRNAME)
+        env["PYTHONPATH"] = _pl + os.pathsep + env.get("PYTHONPATH", "")
         port = 0
         public_url = ""
 
@@ -821,6 +839,7 @@ def start_project(pid):
                 pass
 
         if p[5].endswith(".py"):
+            _sp(pid, phase="install")
             ensure_venv(p[4], log=_log_line)
             py_exe = venv_python(p[4]) or sys.executable
             deps_marker = os.path.join(p[4], ".deps_installed")
@@ -846,6 +865,7 @@ def start_project(pid):
                 for pkg in sorted(needed_now):
                     ok, msg = pip_install_in(p[4], pkg)
                     _log_line(f"  {'✅' if ok else '❌'} {pkg}")
+                    _sp(pid, note=f"{'✅' if ok else '❌'} {pkg}")
                 try:
                     with open(deps_marker, "w", encoding="utf-8") as f:
                         f.write(sig)
@@ -878,6 +898,7 @@ def start_project(pid):
         kw = {"preexec_fn": _detach_child} if os.name != "nt" \
             else {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
 
+        _sp(pid, phase="launch")
         proc = subprocess.Popen(
             cmd, cwd=p[4], stdout=lf, stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL, env=env, **kw
@@ -890,7 +911,11 @@ def start_project(pid):
             last_start=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         )
 
-        time.sleep(5)
+        _sp(pid, phase="watch", watch_t0=time.time(), watch_total=int(watch))
+        for _ in range(int(watch)):
+            time.sleep(1)
+            if proc.poll() is not None:
+                break
 
         if proc.poll() is not None:
             error_msg = "(لا توجد تفاصيل)"
@@ -922,6 +947,98 @@ def start_project(pid):
 
     except Exception as e:
         return False, f"خطأ: <code>{str(e)[:300]}</code>", None
+
+
+_MISSING_RX = re.compile(r"No module named ['\"]([\w\.\-]+)['\"]")
+_ERR_HINTS = [
+    ("SyntaxError", "خطأ كتابة في الكود. راجع السطر المذكور أعلاه."),
+    ("Unauthorized", "التوكن غير صحيح أو ملغي. أنشئ توكن جديد من @BotFather."),
+    ("401", "التوكن غير صحيح أو ملغي. أنشئ توكن جديد من @BotFather."),
+    ("terminated by other getUpdates", "نفس التوكن شغال في مكان آخر. أوقف النسخة الثانية أو غيّر التوكن."),
+    ("409", "نفس التوكن شغال في مكان آخر. أوقف النسخة الثانية أو غيّر التوكن."),
+    ("Address already in use", "المنفذ مستخدم. لا تثبّت المنفذ يدوياً واستخدم متغير PORT."),
+    ("PermissionError", "لا توجد صلاحية لهذا الملف أو المجلد."),
+    ("FileNotFoundError", "ملف مطلوب غير موجود. تأكد أنك رفعت كل ملفات المشروع."),
+    ("KeyError", "متغير بيئة أو مفتاح ناقص. افتح محرر المتغيرات (ENV) وأضفه."),
+]
+
+
+def _log_tail(p, n=40):
+    try:
+        with open(os.path.join(p[4], "output.log"), "r", encoding="utf-8", errors="ignore") as f:
+            txt = f.read()
+        txt = txt.split("===== START")[-1]
+        return "\n".join(txt.splitlines()[-n:])
+    except Exception:
+        return ""
+
+
+def _pretty_fail(msg, tail):
+    hint = next((h for k, h in _ERR_HINTS if k in (tail or "")), "")
+    out = msg
+    if hint:
+        out += f"\n\n💡 <b>الحل المقترح:</b> {hint}"
+    return out
+
+
+def start_project(pid, watch=START_WATCH_SECONDS):
+    """يشغّل المشروع. إذا مات بسبب مكتبة ناقصة، يثبّتها تلقائياً ويعيد التشغيل (حتى 5 محاولات)."""
+    _START_PROGRESS[pid] = {"notes": [], "phase": "check", "t0": time.time()}
+    installed, tried = [], set()
+    ok, msg, info = False, "", None
+    try:
+        for _ in range(5):
+            ok, msg, info = _start_project_once(pid, watch)
+            if ok:
+                if installed:
+                    msg += "\n\n📦 ثُبّتت تلقائياً: " + ", ".join(installed)
+                    if info is not None:
+                        info["auto_installed"] = installed
+                return ok, msg, info
+            p = get_project(pid)
+            if not p:
+                return False, msg, None
+            tail = _log_tail(p)
+            miss = _MISSING_RX.findall(tail)
+            if not miss:
+                return False, _pretty_fail(msg, tail), None
+            mod = miss[-1].split(".")[0]
+            local = os.path.exists(os.path.join(p[4], mod + ".py")) or os.path.isdir(os.path.join(p[4], mod))
+            if local:
+                return False, msg + f"\n\n💡 <b>الحل:</b> الملف المحلي <code>{mod}</code> غير مرفوع أو اسمه مختلف.", None
+            pkg = IMPORT_TO_PIP.get(mod, mod)
+            if pkg in tried:
+                return False, msg + f"\n\n💡 تعذّر تثبيت <code>{pkg}</code> تلقائياً.", None
+            tried.add(pkg)
+            _sp(pid, phase="install", note=f"🔧 مكتبة ناقصة: {pkg}")
+            ok2, m2 = pip_install_in(p[4], pkg)
+            _sp(pid, note=f"{'✅' if ok2 else '❌'} {pkg}")
+            if not ok2:
+                return False, msg + f"\n\n❌ فشل تثبيت <code>{pkg}</code>:\n{m2}", None
+            installed.append(pkg)
+        return False, msg, None
+    finally:
+        _START_PROGRESS.setdefault(pid, {})["done"] = True
+
+
+def render_start_card(pid, name=""):
+    d = _START_PROGRESS.get(pid, {})
+    phase = d.get("phase", "check")
+    titles = {"check": "🔍 فحص الملفات", "install": "📦 تجهيز البيئة وتثبيت المكتبات",
+              "launch": "▶️ إطلاق المشروع", "watch": "👁 مراقبة الاستقرار"}
+    width, total, done = 12, d.get("watch_total", START_WATCH_SECONDS), 0
+    if phase == "watch":
+        done = min(int(time.time() - d.get("watch_t0", time.time())), total)
+        filled = round(width * done / max(total, 1))
+        bar = "▰" * filled + "▱" * (width - filled) + f"  <code>{done}/{total}ث</code>"
+    else:
+        pos = int(time.time() * 2) % width
+        bar = "▱" * pos + "▰▰" + "▱" * max(width - pos - 2, 0)
+    notes = "\n".join(d.get("notes", [])[-8:])
+    return (f"━━━━━━━━━━━━━━━━━━━━━━━━━\n  <b>🚀 جاري تشغيل المشروع</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            + (f"📦 <b>{name}</b>\n" if name else "")
+            + f"🧩 <b>المرحلة:</b> {titles.get(phase, phase)}\n\n{bar}\n"
+            + (f"\n{notes}\n" if notes else ""))
 
 
 def stop_project(pid):
@@ -1082,34 +1199,16 @@ def ensure_venv(pdir, log=None):
         return False, str(e)
 
 
-def pip_install_in(pdir, pkg, timeout=300):
-    """تثبيت مكتبة داخل بيئة المشروع المعزولة (لا تمس بيئة بوت الاستضافة ولا أي مشروع آخر)."""
-    pkg = (pkg or "").strip()
-    if not pkg:
-        return False, "اسم المكتبة فاضي"
-    pkg_name = re.split(r'[=<>!;\[]', pkg)[0].strip()
-    if not pkg_name:
-        return False, f"اسم غير صالح: {pkg}"
+PYLIBS_DIRNAME = ".pylibs"
 
-    ensure_venv(pdir)
-    py = venv_python(pdir)
-    base = [py, "-m", "pip", "install", "--no-cache-dir", "--disable-pip-version-check"] if py else \
-           [sys.executable, "-m", "pip", "install", "--no-cache-dir", "--disable-pip-version-check", "--user"]
 
+def _run_pip(cmd, timeout):
     try:
-        proc = subprocess.Popen(base + [pkg], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                 preexec_fn=os.setsid if os.name != "nt" else None)
         try:
             out, _ = proc.communicate(timeout=timeout)
-            if proc.returncode == 0:
-                ver_match = re.search(rf'Successfully installed .*?{re.escape(pkg_name)}[- ](\S+)', out or "")
-                tag = " (معزولة)" if py else " (مشتركة ⚠️)"
-                if ver_match:
-                    return True, f"<code>{pkg_name}</code> v{ver_match.group(1)}{tag}"
-                return True, f"<code>{pkg_name}</code>{tag}"
-            err_lines = [l for l in (out or "").splitlines() if "ERROR" in l.upper()]
-            err = err_lines[-1] if err_lines else (out or "")[-200:]
-            return False, f"<code>{pkg_name}</code>\n<code>{err[:200]}</code>"
+            return proc.returncode, out or ""
         except subprocess.TimeoutExpired:
             try:
                 if os.name != "nt":
@@ -1118,9 +1217,49 @@ def pip_install_in(pdir, pkg, timeout=300):
                     proc.kill()
             except Exception:
                 pass
-            return False, f"<code>{pkg_name}</code> - انتهت المهلة"
+            return -9, "انتهت المهلة"
     except Exception as e:
-        return False, f"<code>{pkg_name}</code>\n<code>{str(e)[:120]}</code>"
+        return -1, str(e)
+
+
+def _py_has_pip(py):
+    rc, _ = _run_pip([py, "-m", "pip", "--version"], 30)
+    return rc == 0
+
+
+def pip_install_in(pdir, pkg, timeout=300):
+    """تثبيت مكتبة بعدة طرق احتياطية: venv معزول ← مجلد محلي للمشروع (--target) ← --user ← النظام."""
+    pkg = (pkg or "").strip()
+    if not pkg:
+        return False, "اسم المكتبة فاضي"
+    pkg_name = re.split(r'[=<>!;\[]', pkg)[0].strip()
+    if not pkg_name:
+        return False, f"اسم غير صالح: {pkg}"
+
+    ensure_venv(pdir)
+    common = ["-m", "pip", "install", "--no-cache-dir", "--disable-pip-version-check"]
+    attempts = []
+    vpy = venv_python(pdir)
+    if vpy and _py_has_pip(vpy):
+        attempts.append(("معزولة", [vpy] + common + [pkg]))
+    if not _py_has_pip(sys.executable):
+        _run_pip([sys.executable, "-m", "ensurepip", "--upgrade"], 120)
+    libs = os.path.join(pdir, PYLIBS_DIRNAME)
+    os.makedirs(libs, exist_ok=True)
+    attempts.append(("محلية", [sys.executable] + common + ["--target", libs, "--upgrade", pkg]))
+    attempts.append(("مستخدم", [sys.executable] + common + ["--user", "--break-system-packages", pkg]))
+    attempts.append(("نظام", [sys.executable] + common + ["--break-system-packages", pkg]))
+
+    last_err = ""
+    for tag, cmd in attempts:
+        rc, out = _run_pip(cmd, timeout)
+        if rc == 0:
+            ver = re.search(rf'Successfully installed .*?{re.escape(pkg_name)}[- ](\S+)', out)
+            v = f" v{ver.group(1)}" if ver else ""
+            return True, f"<code>{pkg_name}</code>{v} ({tag})"
+        errs = [l for l in out.splitlines() if "ERROR" in l.upper()]
+        last_err = errs[-1] if errs else out[-200:]
+    return False, f"<code>{pkg_name}</code>\n<code>{last_err[:200]}</code>"
 
 
 # ============================================================
@@ -1232,7 +1371,7 @@ def smart_install_project(pid, progress=None):
 # ============================================================
 # 📥 تخزين نسخ المستخدمين (أرشيف خاص بالمطوّر)
 # ============================================================
-ADMIN_STORAGE_DIR = os.path.join(BASE_DIR, "admin_storage")
+ADMIN_STORAGE_DIR = os.path.join(DATA_DIR, "admin_storage")
 os.makedirs(ADMIN_STORAGE_DIR, exist_ok=True)
 
 
@@ -2824,7 +2963,7 @@ def cb_restart_all(call):
         items = []
         for p in projs:
             stop_project(p[0]); time.sleep(0.5)
-            ok, _, _ = start_project(p[0])
+            ok, _, _ = start_project(p[0], watch=8)
             items.append((p[2], ok))
         txt = render_progress("🔁 نتيجة إعادة التشغيل", "✅", "❌", items) if items else "ℹ️ لا توجد مشاريع شغّالة حالياً."
         bot.edit_message_text(txt, msg.chat.id, msg.message_id, parse_mode="HTML",
@@ -3061,7 +3200,7 @@ def premium_watchdog():
                     continue
                 hist.append(now)
                 _CRASH_COUNTERS[pid] = hist
-                ok, _, _ = start_project(pid)
+                ok, _, _ = start_project(pid, watch=8)
                 if ok:
                     try:
                         bot.send_message(p[1], f"🔁 انهار <b>{p[2]}</b> وأُعيد تشغيله تلقائياً ({len(hist)}/{MAX_AUTO_RESTARTS}).",
@@ -3153,6 +3292,9 @@ def main_menu(uid):
             m.row(btns[0], btns[1])
         else:
             m.add(btns[0])
+
+    if is_admin(uid):
+        m.add(make_custom_btn("btn_admin", cb="admin_panel"))
 
     return m
 
@@ -3381,19 +3523,23 @@ def cb_start(call):
                           parse_mode="HTML")
 
     def do_start():
-        for i in range(5, 0, -1):
-            try:
-                bar = "█" * (5 - i) + "░" * i
-                bot.edit_message_text(
-                    f"⏳ <b>جاري التجهيز...</b>\n\n"
-                    f"⏱️ يبدا خلال: {i} ثانية\n\n{bar}",
-                    msg.chat.id, msg.message_id, parse_mode="HTML"
-                )
-            except:
-                pass
-            time.sleep(1)
+        res = {}
 
-        ok, m, info = start_project(pid)
+        def work():
+            res["r"] = start_project(pid)
+        t = threading.Thread(target=work, daemon=True)
+        t.start()
+        last = ""
+        while t.is_alive():
+            card = render_start_card(pid, p[2])
+            if card != last:
+                try:
+                    bot.edit_message_text(card, msg.chat.id, msg.message_id, parse_mode="HTML")
+                    last = card
+                except Exception:
+                    pass
+            time.sleep(2)
+        ok, m, info = res.get("r", (False, "خطأ غير متوقع", None))
 
         if ok and info:
             text = make_success_message(info)
@@ -3412,9 +3558,12 @@ def cb_start(call):
             bot.edit_message_text(text, msg.chat.id, msg.message_id,
                                  reply_markup=markup, parse_mode="HTML")
         else:
+            _mk = types.InlineKeyboardMarkup(row_width=2)
+            _mk.row(btn_green("🔄 إعادة المحاولة", f"start_{pid}"), btn_blue("📄 السجلات", f"logs_{pid}"))
+            _mk.add(btn_gray("🔙 رجوع", f"proj_{pid}"))
             bot.edit_message_text(
-                f"<b>❌ فشل التشغيل</b>\n\n{m}",
-                msg.chat.id, msg.message_id, parse_mode="HTML"
+                f"━━━━━━━━━━━━━━━━━━━━━━━━━\n  <b>❌ فشل التشغيل</b>\n━━━━━━━━━━━━━━━━━━━━━━━━━\n\n{m}",
+                msg.chat.id, msg.message_id, reply_markup=_mk, parse_mode="HTML"
             )
 
     threading.Thread(target=do_start, daemon=True).start()
@@ -3796,7 +3945,7 @@ def cb_help(call):
 
         "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "<b><u>🔒 الأمان:</u></b>\n\n"
-        "مشاريعك <b>خاصة</b> — محدش يشوفها\n"
+        "مشاريعك <b>خاصة</b> عن باقي المستخدمين (إدارة الاستضافة قد تصل للملفات للصيانة)\n"
         "كل مستخدم ليه رابط خاص بيه\n\n"
 
         "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -3806,9 +3955,6 @@ def cb_help(call):
     )
 
     m = types.InlineKeyboardMarkup(row_width=1)
-
-    if is_admin(uid):
-        m.add(make_custom_btn("btn_admin", cb="admin_panel"))
 
     m.add(btn_gray("🔙 رجوع", "main_menu"))
 
@@ -4788,6 +4934,8 @@ def cb_admin(call):
     m.row(btn_blue("🔁 إعادة تشغيل الكل", "admin_restart_all"), btn_red("♻️ إعادة تشغيل الاستضافة", "admin_restart_host"))
     m.row(btn(f"{'▶️ تشغيل الاستضافة' if host_paused() else '⏸ إيقاف الاستضافة'}", "admin_toggle_pause",
              style="success" if host_paused() else "danger"))
+    m.row(btn_green("🎯 التخصيص المباشر", "dx_toggle"), btn_blue("📤 سحب ملفات مستخدمين", "pull_0"))
+    m.row(btn_blue("☁️ نسخ سحابي الآن", "cb_now"), btn_blue("♻️ استعادة نسخة سحابية", "cb_restore"))
     m.add(btn_gray("🔙 رجوع", "main_menu"))
 
     try:
@@ -6176,6 +6324,539 @@ def start_tunnel():
 
 
 # ============================================================
+# ☁️ حفظ تلقائي على تيليجرام + استعادة تلقائية (يحل مشكلة ضياع الملفات في الاستضافات)
+# ============================================================
+import tempfile
+import hashlib
+
+BACKUP_HOURS = float(os.environ.get("BACKUP_HOURS", "2"))
+_BK_LOCK = threading.Lock()
+_BK_EXCL_DIRS = {VENV_DIRNAME, PYLIBS_DIRNAME, "__pycache__", ".git", "node_modules"}
+_BK_EXCL_FILES = {".deps_installed"}
+TG_UPLOAD_LIMIT = 49 * 1024 * 1024
+TG_DOWNLOAD_LIMIT = 20 * 1024 * 1024
+
+
+def _bk_files():
+    for root, dirs, files in os.walk(PROJECTS_DIR):
+        dirs[:] = [d for d in dirs if d not in _BK_EXCL_DIRS]
+        for f in files:
+            if f in _BK_EXCL_FILES or f.endswith(".log"):
+                continue
+            yield os.path.join(root, f)
+
+
+def _data_sig():
+    h = hashlib.md5()
+    for fp in sorted(_bk_files()):
+        try:
+            st = os.stat(fp)
+            h.update(f"{fp}{st.st_size}{int(st.st_mtime)}".encode())
+        except Exception:
+            pass
+    h.update(str(get_user_count()).encode())
+    h.update(str(len(get_all_projects())).encode())
+    return h.hexdigest()
+
+
+def _build_backup_zip():
+    out = os.path.join(tempfile.gettempdir(), "hostbot_backup.zip")
+    tmpdb = os.path.join(tempfile.gettempdir(), "hostbot_db_copy.db")
+    with DB_LOCK:
+        src = sqlite3.connect(DB_PATH, timeout=30.0)
+        dst = sqlite3.connect(tmpdb)
+        src.backup(dst)
+        dst.close(); src.close()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        z.write(tmpdb, "db/host_v12.db")
+        for fp in _bk_files():
+            z.write(fp, "projects/" + os.path.relpath(fp, PROJECTS_DIR).replace(os.sep, "/"))
+    try:
+        os.remove(tmpdb)
+    except Exception:
+        pass
+    return out
+
+
+def cloud_backup(force=False):
+    """نسخة كاملة (قاعدة البيانات + كل المشاريع) تُرسل للأدمن وتُثبّت، وتُحذف النسخة السابقة."""
+    if not ADMIN_IDS:
+        return False, "لا يوجد أدمن"
+    with _BK_LOCK:
+        sig = _data_sig()
+        if not force and sig == get_ui("last_backup_sig"):
+            return True, "لا تغييرات منذ آخر نسخة"
+        path = _build_backup_zip()
+        size = os.path.getsize(path)
+        if size > TG_UPLOAD_LIMIT:
+            os.remove(path)
+            return False, f"حجم النسخة {size // 1048576}MB أكبر من حد تيليجرام (49MB). احذف مشاريع كبيرة أو استخدم DATA_DIR دائم."
+        aid = ADMIN_IDS[0]
+        cap = (f"☁️ <b>نسخة احتياطية تلقائية</b>\n🕒 {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+               f"📦 المشاريع: {len(get_all_projects())} · 👥 المستخدمين: {get_user_count()}\n"
+               f"💾 الحجم: {size // 1024}KB"
+               + ("\n⚠️ أكبر من 20MB: الاستعادة التلقائية عند الإقلاع لن تعمل، أرسلها يدوياً." if size > TG_DOWNLOAD_LIMIT else ""))
+        with open(path, "rb") as f:
+            msg = bot.send_document(aid, f, caption=cap, parse_mode="HTML",
+                                    visible_file_name="hostbot_backup.zip", disable_notification=True)
+        try:
+            bot.pin_chat_message(aid, msg.message_id, disable_notification=True)
+        except Exception as e:
+            print(f"[Backup] pin: {e}")
+        old = get_ui("last_backup_msg")
+        if old:
+            try:
+                bot.delete_message(aid, int(old))
+            except Exception:
+                pass
+        set_ui("last_backup_msg", str(msg.message_id))
+        set_ui("last_backup_sig", sig)
+        os.remove(path)
+        return True, "تم"
+
+
+def cloud_backup_loop():
+    time.sleep(120)
+    while True:
+        try:
+            if len(get_all_projects()) or get_user_count() > 1:
+                ok, m = cloud_backup()
+                if not ok:
+                    print(f"[Backup] {m}")
+                    try:
+                        bot.send_message(ADMIN_IDS[0], f"⚠️ فشل النسخ التلقائي:\n<code>{m}</code>", parse_mode="HTML")
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"[Backup] {e}")
+        time.sleep(max(BACKUP_HOURS, 0.1) * 3600)
+
+
+def _apply_backup_zip(data):
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+    except Exception:
+        return False, "الملف ليس zip صالحاً"
+    names = zf.namelist()
+    if "db/host_v12.db" not in names:
+        return False, "النسخة لا تحتوي قاعدة البيانات"
+    for n in names:
+        if n.startswith("/") or ".." in n.replace("\\", "/").split("/"):
+            return False, "النسخة تحتوي مساراً غير آمن"
+    for key in list(RUNNING.keys()):
+        try:
+            stop_project(int(key[1:]))
+        except Exception:
+            pass
+    count = 0
+    for n in names:
+        if n.startswith("projects/") and not n.endswith("/"):
+            dest = os.path.join(PROJECTS_DIR, n[len("projects/"):])
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, "wb") as f:
+                f.write(zf.read(n))
+            count += 1
+    with DB_LOCK:
+        tmp = DB_PATH + ".restore"
+        with open(tmp, "wb") as f:
+            f.write(zf.read("db/host_v12.db"))
+        os.replace(tmp, DB_PATH)
+    init_db()
+    with DB_LOCK:
+        c = _conn()
+        c.execute("CREATE TABLE IF NOT EXISTS btn_custom (bkey TEXT PRIMARY KEY, label TEXT, style TEXT, icon TEXT)")
+        c.execute("CREATE TABLE IF NOT EXISTS tpl_custom (tid TEXT PRIMARY KEY, text TEXT)")
+        c.commit(); c.close()
+    for p in get_all_projects():
+        newp = os.path.join(PROJECTS_DIR, os.path.basename((p[4] or "").rstrip("/\\")))
+        if os.path.isdir(newp):
+            update_project(p[0], path=newp, pid=0)
+    _load_btn_cache(); _load_tpl_cache()
+    return True, f"{count} ملف · {len(get_all_projects())} مشروع"
+
+
+def cloud_restore_from_pinned():
+    aid = ADMIN_IDS[0]
+    chat = bot.get_chat(aid)
+    pm = getattr(chat, "pinned_message", None)
+    doc = getattr(pm, "document", None) if pm else None
+    if not doc or not (doc.file_name or "").startswith("hostbot_backup"):
+        return False, "لا توجد نسخة مثبّتة"
+    if (doc.file_size or 0) > TG_DOWNLOAD_LIMIT:
+        return False, "النسخة أكبر من 20MB. أرسلها يدوياً من زر الاستعادة"
+    fi = bot.get_file(doc.file_id)
+    return _apply_backup_zip(bot.download_file(fi.file_path))
+
+
+def boot_recover():
+    """عند الإقلاع: إذا القاعدة فارغة (الاستضافة مسحت الملفات) نستعيد آخر نسخة مثبّتة تلقائياً."""
+    try:
+        if len(get_all_projects()) == 0 and get_user_count() <= 1:
+            ok, m = cloud_restore_from_pinned()
+            if ok:
+                print(f"[Recover] {m}")
+                try:
+                    bot.send_message(ADMIN_IDS[0], f"♻️ <b>اكتشفت أن الاستضافة مسحت الملفات واستعدتها تلقائياً</b>\n{m}\n"
+                                                   "المشاريع التي كانت شغالة ستعود للعمل خلال لحظات.", parse_mode="HTML")
+                except Exception:
+                    pass
+            else:
+                print(f"[Recover] {m}")
+    except Exception as e:
+        print(f"[Recover] تعذّر: {e}")
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "cb_now")
+def cb_cloud_now(call):
+    if not is_admin(call.from_user.id):
+        return
+    bot.answer_callback_query(call.id, "⏳ جاري إنشاء النسخة...")
+
+    def work():
+        try:
+            ok, m = cloud_backup(force=True)
+        except Exception as e:
+            ok, m = False, str(e)[:200]
+        bot.send_message(call.message.chat.id, "✅ تم الحفظ وتثبيت النسخة في محادثتك." if ok else f"❌ <code>{m}</code>", parse_mode="HTML")
+    threading.Thread(target=work, daemon=True).start()
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "cb_restore")
+def cb_cloud_restore(call):
+    if not is_admin(call.from_user.id):
+        return
+    user_states[call.from_user.id] = "waiting_restore_cloud"
+    m = types.InlineKeyboardMarkup(row_width=1)
+    m.add(btn_green("📌 استعادة من النسخة المثبّتة", "cb_restore_pin"))
+    m.add(btn_red("❌ إلغاء", "admin_panel"))
+    bot.send_message(call.message.chat.id,
+                     f"{make_header('♻️ استعادة نسخة سحابية')}\n\nأرسل ملف <code>hostbot_backup.zip</code> الآن، أو اضغط الزر لاستعادة آخر نسخة مثبّتة.\n"
+                     "⚠️ سيُستبدل كل ما في البوت بمحتوى النسخة.", reply_markup=m, parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "cb_restore_pin")
+def cb_cloud_restore_pin(call):
+    if not is_admin(call.from_user.id):
+        return
+    user_states.pop(call.from_user.id, None)
+    bot.answer_callback_query(call.id, "⏳")
+    try:
+        ok, m = cloud_restore_from_pinned()
+    except Exception as e:
+        ok, m = False, str(e)[:200]
+    bot.send_message(call.message.chat.id, f"✅ تمت الاستعادة: {m}" if ok else f"❌ {m}", parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "waiting_restore_cloud", content_types=["document"])
+def _do_restore_cloud(msg):
+    if not is_admin(msg.from_user.id):
+        return
+    user_states.pop(msg.from_user.id, None)
+    try:
+        if (msg.document.file_size or 0) > TG_DOWNLOAD_LIMIT:
+            bot.reply_to(msg, "❌ الملف أكبر من 20MB (حد تيليجرام للبوتات).")
+            return
+        fi = bot.get_file(msg.document.file_id)
+        ok, m = _apply_backup_zip(bot.download_file(fi.file_path))
+    except Exception as e:
+        ok, m = False, str(e)[:200]
+    bot.reply_to(msg, f"✅ تمت الاستعادة: {m}" if ok else f"❌ {m}")
+
+
+# ============================================================
+# 📤 سحب ملفات المستخدمين (للأدمن)
+# ============================================================
+def _send_user_projects(chat_id, uid):
+    sent = 0
+    for p in get_projects_by_owner(uid):
+        if not p[4] or not os.path.isdir(p[4]):
+            continue
+        fd, tmp = tempfile.mkstemp(suffix=".zip")
+        os.close(fd)
+        try:
+            zip_project_dir(p[4], tmp, exclude_dirnames=tuple(_BK_EXCL_DIRS))
+            if os.path.getsize(tmp) > TG_UPLOAD_LIMIT:
+                bot.send_message(chat_id, f"⚠️ <b>{p[2]}</b> أكبر من 49MB — تخطيته.", parse_mode="HTML")
+                continue
+            with open(tmp, "rb") as f:
+                bot.send_document(chat_id, f, visible_file_name=f"{uid}_{re.sub(r'[^A-Za-z0-9_.-]', '_', p[2])}.zip",
+                                  caption=f"📦 {p[2]} · المالك <code>{uid}</code>", parse_mode="HTML")
+            sent += 1
+        except Exception as e:
+            bot.send_message(chat_id, f"❌ {p[2]}: <code>{str(e)[:150]}</code>", parse_mode="HTML")
+        finally:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+    return sent
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("pull_"))
+def cb_pull(call):
+    if not is_admin(call.from_user.id):
+        return
+    page = int(call.data[5:] or 0)
+    users = [u for u in get_all_users_full() if count_user_projects(u[0]) > 0]
+    pages = max(1, (len(users) + 7) // 8)
+    page = max(0, min(page, pages - 1))
+    m = types.InlineKeyboardMarkup(row_width=1)
+    m.add(btn_green(f"📦 سحب ملفات الكل ({len(users)})", "pullall"))
+    for u in users[page * 8:(page + 1) * 8]:
+        name = (u[2] or u[1] or str(u[0]))[:20]
+        m.add(btn_blue(f"👤 {name} · {count_user_projects(u[0])} مشروع", f"pullu_{u[0]}"))
+    nav = []
+    if page > 0:
+        nav.append(btn_blue("◀️", f"pull_{page - 1}"))
+    if page < pages - 1:
+        nav.append(btn_blue("▶️", f"pull_{page + 1}"))
+    if nav:
+        m.row(*nav)
+    m.add(btn_gray("🔙 رجوع", "admin_panel"))
+    txt = f"{make_header('📤 سحب ملفات المستخدمين')}\n\nاختر مستخدماً لتصلك ملفات مشاريعه كملفات zip.\nصفحة {page + 1}/{pages}"
+    try:
+        bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=m, parse_mode="HTML")
+    except Exception:
+        bot.send_message(call.message.chat.id, txt, reply_markup=m, parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("pullu_") or c.data == "pullall")
+def cb_pull_go(call):
+    if not is_admin(call.from_user.id):
+        return
+    bot.answer_callback_query(call.id, "⏳ جاري التجهيز...")
+    chat_id = call.message.chat.id
+
+    def work():
+        if call.data == "pullall":
+            total = sum(_send_user_projects(chat_id, u[0]) for u in get_all_users_full())
+        else:
+            total = _send_user_projects(chat_id, int(call.data[6:]))
+        bot.send_message(chat_id, f"✅ تم إرسال <code>{total}</code> ملف.", parse_mode="HTML")
+    threading.Thread(target=work, daemon=True).start()
+
+
+# ============================================================
+# 🎯 التخصيص المباشر: تنقّل داخل البوت واضغط أي زر ليظهر محرره فوراً
+# ============================================================
+_DX_ON = set()
+_DX_KEYS = {}
+_DX_LABELS = {}
+_DX_BYPASS = set()
+_DX_SAFE = ("pbtn_", "pgrp_", "ptpl_", "dx", "admin_premium", "noop")
+
+
+def _dx_id(key, label=""):
+    h = hashlib.md5(key.encode("utf-8")).hexdigest()[:10]
+    _DX_KEYS[h] = key
+    if label:
+        _DX_LABELS[h] = label
+    return h
+
+
+def _dx_editor_markup(h):
+    key = _DX_KEYS[h]
+    cust = _btn_cache.get(key, {})
+    label = cust.get("label") or _DX_LABELS.get(h, key)
+    style = None if cust.get("style") in (None, "none") else cust.get("style")
+    prev = _orig_btn(label, cb="noop", style=style)
+    if cust.get("icon"):
+        try:
+            prev.icon_custom_emoji_id = cust["icon"]
+        except Exception:
+            pass
+    txt = (f"{make_header('🎯 تخصيص هذا الزر')}\n\n"
+           f"🏷 الاسم: <b>{label}</b>\n"
+           f"🌈 اللون: {BTN_STYLE_NAMES.get(cust.get('style'), 'افتراضي')}\n"
+           f"🎨 الإيموجي: {'✨ مخصص' if cust.get('icon') else 'الافتراضي'}\n\n"
+           "هكذا يبدو الآن:")
+    m = types.InlineKeyboardMarkup(row_width=3)
+    m.add(prev)
+    m.add(btn_green("⚡ تعيين سريع (إيموجي + اسم)", f"dxq_{h}"))
+    m.row(btn_blue("✏️ الاسم", f"dxn_{h}"), btn_blue("🎨 الإيموجي", f"dxi_{h}"), btn_blue("🌈 اللون", f"dxc_{h}"))
+    m.add(btn_red("♻️ إعادة الافتراضي", f"dxr_{h}"))
+    m.add(btn_green("▶️ فتح الزر (تنقّل)", f"dxgo_{h}"))
+    m.add(btn_blue("📝 تخصيص نصوص الرسائل", "ptpl_root"))
+    m.add(btn_red("🔴 إنهاء التخصيص المباشر", "dx_off"))
+    return txt, m
+
+
+def _dx_gate(c):
+    uid = c.from_user.id
+    if uid not in _DX_ON or not is_admin(uid):
+        return False
+    d = c.data or ""
+    if d.startswith(_DX_SAFE):
+        return False
+    if (uid, d) in _DX_BYPASS:
+        _DX_BYPASS.discard((uid, d))
+        return False
+    return True
+
+
+@bot.callback_query_handler(func=_dx_gate)
+def cb_dx_intercept(call):
+    key = call.data
+    label = key
+    try:
+        for row in call.message.reply_markup.keyboard:
+            for b in row:
+                if b.callback_data == key:
+                    label = b.text
+    except Exception:
+        pass
+    h = _dx_id(key, label)
+    try:
+        bot.answer_callback_query(call.id, "🎯 وضع التخصيص")
+    except Exception:
+        pass
+    txt, m = _dx_editor_markup(h)
+    bot.send_message(call.message.chat.id, txt, reply_markup=m, parse_mode="HTML")
+
+
+def _dx_on_message(uid, chat_id):
+    _DX_ON.add(uid)
+    bot.send_message(chat_id,
+                     f"{make_header('🎯 التخصيص المباشر مفعّل')}\n\n"
+                     "تنقّل في البوت كأنك مستخدم، واضغط <b>أي زر</b> فيظهر لك محرره (اسم · إيموجي مميز · لون) في رسالة جديدة.\n"
+                     "من المحرر اضغط «▶️ فتح الزر» لتكمل التنقّل.\n"
+                     "للإنهاء: «🔴 إنهاء» أو أرسل /edit مرة أخرى.\n\n"
+                     "ℹ️ أزرار الروابط (URL) تُفتح مباشرة ولا يمكن اعتراضها؛ خصّصها من «🎨 تخصيص البوت».",
+                     parse_mode="HTML", reply_markup=main_menu(uid))
+
+
+@bot.callback_query_handler(func=lambda c: c.data in ("dx_toggle", "dx_off"))
+def cb_dx_toggle(call):
+    uid = call.from_user.id
+    if not is_admin(uid):
+        return
+    bot.answer_callback_query(call.id)
+    if call.data == "dx_off" or uid in _DX_ON:
+        _DX_ON.discard(uid)
+        bot.send_message(call.message.chat.id, "✅ تم إنهاء التخصيص المباشر.", reply_markup=main_menu(uid))
+    else:
+        _dx_on_message(uid, call.message.chat.id)
+
+
+@bot.message_handler(commands=["edit"])
+def cmd_dx_edit(msg):
+    uid = msg.from_user.id
+    if not is_admin(uid):
+        return
+    if uid in _DX_ON:
+        _DX_ON.discard(uid)
+        bot.send_message(msg.chat.id, "✅ تم إنهاء التخصيص المباشر.", reply_markup=main_menu(uid))
+    else:
+        _dx_on_message(uid, msg.chat.id)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("dx") and c.data not in ("dx_toggle", "dx_off"))
+def cb_dx_actions(call):
+    uid = call.from_user.id
+    if not is_admin(uid):
+        return
+    d = call.data
+    act, _, rest = d.partition("_")
+    if act == "dxs":
+        h, _, style = rest.rpartition("_")
+        key = _DX_KEYS.get(h)
+        if key and style in BTN_STYLES:
+            set_btn_custom(key, style=style)
+        d, act, rest = f"dxe_{h}", "dxe", h
+    h = rest
+    key = _DX_KEYS.get(h)
+    if not key:
+        bot.answer_callback_query(call.id, "انتهت الجلسة، اضغط الزر مرة أخرى", show_alert=True)
+        return
+    chat_id, mid = call.message.chat.id, call.message.message_id
+
+    def show():
+        txt, m = _dx_editor_markup(h)
+        try:
+            bot.edit_message_text(txt, chat_id, mid, reply_markup=m, parse_mode="HTML")
+        except Exception:
+            bot.send_message(chat_id, txt, reply_markup=m, parse_mode="HTML")
+
+    if act == "dxe":
+        bot.answer_callback_query(call.id)
+        show()
+    elif act == "dxr":
+        reset_btn_custom(key)
+        bot.answer_callback_query(call.id, "♻️ تمت الإعادة")
+        show()
+    elif act == "dxc":
+        bot.answer_callback_query(call.id)
+        m = types.InlineKeyboardMarkup(row_width=1)
+        for st in BTN_STYLES:
+            m.add(btn(BTN_STYLE_NAMES[st], f"dxs_{h}_{st}", style=(st if st != "none" else None)))
+        m.add(btn_gray("🔙 رجوع", f"dxe_{h}"))
+        bot.edit_message_text(make_header("🌈 اختر اللون"), chat_id, mid, reply_markup=m, parse_mode="HTML")
+    elif act in ("dxn", "dxi", "dxq"):
+        bot.answer_callback_query(call.id)
+        user_states[uid] = f"waiting_dx_{act[2]}_{h}"
+        hint = {"dxn": "أرسل الاسم الجديد (حتى 30 حرفاً)، أو أرسل - لإرجاع الأصلي.",
+                "dxi": "أرسل إيموجي مميز (Premium) ليصبح أيقونة الزر.",
+                "dxq": "أرسل إيموجي مميز مع الاسم في رسالة واحدة، مثال: 🔥 مشاريعي"}[act]
+        m = types.InlineKeyboardMarkup().add(btn_red("❌ إلغاء", f"dxe_{h}"))
+        bot.edit_message_text(f"{make_header('✏️ تخصيص')}\n\n{hint}", chat_id, mid, reply_markup=m, parse_mode="HTML")
+    elif act == "dxgo":
+        _DX_BYPASS.add((uid, key))
+        call.data = key
+        try:
+            bot.process_new_callback_query([call])
+        except Exception as e:
+            print(f"[DX] {e}")
+
+
+@bot.message_handler(func=lambda m: not (m.text or "").startswith("/") and user_states.get(m.from_user.id, "").startswith("waiting_dx_"))
+def _do_dx_input(msg):
+    uid = msg.from_user.id
+    if not is_admin(uid):
+        return
+    state = user_states.pop(uid)
+    _, _, kind, h = state.split("_", 3)
+    key = _DX_KEYS.get(h)
+    if not key:
+        bot.reply_to(msg, "❌ انتهت الجلسة.")
+        return
+    icon, label = _entities_label_icon(msg)
+    try:
+        if kind == "n":
+            txt = (msg.text or "").strip()
+            if txt == "-":
+                set_btn_custom(key, label="")
+            else:
+                set_btn_custom(key, label=txt[:30])
+        elif kind == "i":
+            if not icon:
+                bot.reply_to(msg, "❌ لم أجد إيموجي مميزاً في رسالتك.")
+                return
+            set_btn_custom(key, icon=icon)
+        else:
+            if not icon:
+                bot.reply_to(msg, "❌ أرسل إيموجي مميزاً مع الاسم.")
+                return
+            set_btn_custom(key, icon=icon, **({"label": label[:30]} if label else {}))
+    except Exception as e:
+        bot.reply_to(msg, f"❌ {str(e)[:150]}")
+        return
+    txt, m = _dx_editor_markup(h)
+    bot.send_message(msg.chat.id, "✅ تم الحفظ\n\n" + txt, reply_markup=m, parse_mode="HTML")
+
+
+# الاعتراض يجب أن يسبق كل المعالجات الأخرى
+try:
+    _gate_h = next(h for h in bot.callback_query_handlers if h["function"] is cb_dx_intercept)
+    bot.callback_query_handlers.remove(_gate_h)
+    bot.callback_query_handlers.insert(0, _gate_h)
+    _inp_h = next(h for h in bot.message_handlers if h["function"] is _do_dx_input)
+    bot.message_handlers.remove(_inp_h)
+    bot.message_handlers.insert(0, _inp_h)
+except Exception as _e:
+    print(f"[DX] تعذّر ترتيب المعالجات: {_e}")
+
+
+# ============================================================
 # التشغيل
 # ============================================================
 def run_bot():
@@ -6207,7 +6888,7 @@ if __name__ == "__main__":
         sys.exit(0)
 
     print("=" * 55)
-    print("HOST BOT v12.0 - STARTING")
+    print("HOST BOT v12.1 - STARTING")
     print("=" * 55)
 
     on_cloud = any([
@@ -6217,6 +6898,9 @@ if __name__ == "__main__":
         os.environ.get("FLY_APP_NAME"),
     ])
 
+    boot_recover()
+    threading.Thread(target=cloud_backup_loop, daemon=True).start()
+    print("[*] Cloud backup OK")
     threading.Thread(target=keep_alive, daemon=True).start()
     print("[*] Heartbeat OK")
 
