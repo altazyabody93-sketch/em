@@ -1391,6 +1391,12 @@ def keep_alive():
                 f"[Heartbeat] {datetime.now().strftime('%H:%M:%S')} | "
                 f"running={running_count} | tunnel={TUNNEL_URL or 'none'}"
             )
+            ext_url = os.environ.get("RENDER_EXTERNAL_URL") or TUNNEL_URL
+            if ext_url and get_ui("demo_web_ping") != "0" and int(time.time()) % 600 < 35:
+                try:
+                    urllib.request.urlopen(ext_url.rstrip("/") + "/ping", timeout=8).read()
+                except Exception:
+                    pass
         except:
             pass
             
@@ -4565,11 +4571,11 @@ def cb_admin(call):
     m = types.InlineKeyboardMarkup(row_width=2)
     m.row(btn_red("📢 اعلان", "broadcast"), btn_blue("📊 احصائيات", "admin_stats"))
     m.row(btn_blue("👥 المستخدمين", "admin_users"), btn_blue("📦 المشاريع", "admin_projs"))
-    m.row(btn_blue("🔗 Tunnel", "admin_tunnel"), btn_blue("📥 تخزين المطوّر", "admin_storage_0"))
+    m.row(btn_blue("🔗 Tunnel", "admin_tunnel"), btn_green("🌐 ويب المراقبة (OK)", "admin_demo_web"))
+    m.row(btn_blue("📥 تخزين المطوّر", "admin_storage_0"), btn_blue("💳 المدفوعات والباقات", "admin_billing"))
     m.row(btn_blue("📋 سجل الاحداث", "admin_logs"), btn_green("🔓 فك حظر", "admin_unban"))
     mode_lbl = "💰 الوضع: مدفوع 💎" if is_paid_mode() else "🆓 الوضع: مجاني"
     m.row(btn_green("🎨 تخصيص البوت (أزرار + نصوص + نسخ)", "admin_premium"))
-    m.row(btn_blue(f"💳 إدارة المدفوعات والباقات ({mode_lbl})", "admin_billing"))
     m.row(btn_blue("💽 نسخة DB كاملة", "admin_backup_db"), btn_blue("📥 استعادة DB كاملة", "admin_restore_db"))
     m.row(btn_blue("🔁 إعادة تشغيل الكل", "admin_restart_all"), btn_red("♻️ إعادة تشغيل الاستضافة", "admin_restart_host"))
     m.row(btn(f"{'▶️ تشغيل الاستضافة' if host_paused() else '⏸ إيقاف الاستضافة'}", "admin_toggle_pause",
@@ -5432,15 +5438,66 @@ def cb_adm_prices(call):
                           reply_markup=m, parse_mode="HTML")
 
 
+@bot.callback_query_handler(func=lambda c: c.data == "admin_demo_web")
+def cb_admin_demo_web(call):
+    if not is_admin(call.from_user.id):
+        return
+    base = get_public_url().rstrip("/")
+    ping_on = get_ui("demo_web_ping") != "0"
+    txt = (
+        f"{make_header('🌐 ويب المراقبة التجريبي (OK)')}\n\n"
+        f"📡 <b>حالة السيرفر:</b> <code>OK (200)</code>\n"
+        f"🔄 <b>النبض التلقائي:</b> {'🟢 شغال (كل 10 دقائق)' if ping_on else '🔴 متوقف'}\n\n"
+        f"🔗 <b>روابط المراقبة لـ UptimeRobot / Render:</b>\n"
+        f"• الرئيسي: <code>{base}/</code>\n"
+        f"• فحص سريع: <code>{base}/ping</code>\n"
+        f"• الحالة JSON: <code>{base}/status</code>\n\n"
+        "💡 <i>أضف أي رابط منها في UptimeRobot لمنع نوم السيرفر المفاجئ، أو شغّل الملف بـ <code>--web-only</code> لتشغيل الويب التجريبي فقط.</i>"
+    )
+    m = types.InlineKeyboardMarkup(row_width=1)
+    m.add(btn("🔄 " + ("إيقاف النبض التلقائي" if ping_on else "تفعيل النبض التلقائي"),
+              "admin_toggle_demo_ping", style="danger" if ping_on else "success"))
+    m.add(btn_blue("🌐 فتح رابط /ping", url=f"{base}/ping"))
+    m.add(btn_gray("🔙 رجوع", "admin_panel"))
+    try:
+        bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=m, parse_mode="HTML")
+    except Exception:
+        bot.send_message(call.message.chat.id, txt, reply_markup=m, parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "admin_toggle_demo_ping")
+def cb_toggle_demo_ping(call):
+    if not is_admin(call.from_user.id):
+        return
+    cur_on = get_ui("demo_web_ping") != "0"
+    set_ui("demo_web_ping", "0" if cur_on else "1")
+    bot.answer_callback_query(call.id, "✅ تم " + ("إيقاف" if cur_on else "تفعيل") + " النبض التلقائي")
+    cb_admin_demo_web(call)
+
+
 # ============================================================
 # Flask + Web Dashboard
 # ============================================================
 web = Flask(__name__)
 
 # 👇 ضيف السطور دي هنا 👇
-@web.route('/health')
+@web.route('/health', methods=['GET', 'HEAD'])
+@web.route('/ping', methods=['GET', 'HEAD'])
+@web.route('/demo', methods=['GET', 'HEAD'])
 def health():
+    if request.method == 'HEAD':
+        return "", 200
     return "OK", 200
+
+
+@web.route('/status', methods=['GET'])
+def web_status():
+    return {
+        "status": "OK",
+        "uptime": calc_uptime(START_TIME.strftime('%Y-%m-%d %H:%M:%S')),
+        "started_at": START_TIME.strftime('%Y-%m-%d %H:%M:%S'),
+        "self_ping": get_ui("demo_web_ping") != "0",
+    }, 200
 # 👆 لحد هنا 👆
 
 # ============================================================
@@ -5673,9 +5730,20 @@ function filterCards(){
 """
 
 
-@web.route('/')
+@web.route('/', methods=['GET', 'HEAD'])
 def home():
     token = request.args.get("token")
+    if not token:
+        if request.method == 'HEAD':
+            return "", 200
+        up = calc_uptime(START_TIME.strftime('%Y-%m-%d %H:%M:%S'))
+        return f"""<!DOCTYPE html>
+<html lang="ar" dir="rtl"><head><meta charset="UTF-8"><title>OK - Bot Online</title></head>
+<body style="background:#060a14;color:#e2e8f0;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0">
+<div style="background:#0f172a;border:1px solid #22c55e55;border-radius:16px;padding:32px 42px;text-align:center;box-shadow:0 12px 40px #0006">
+<div style="font-size:2.4em;font-weight:800;color:#4ade80;letter-spacing:2px">OK</div>
+<div style="margin-top:8px;color:#94a3b8;font-size:0.95em">Host Bot شغال وجاهز للمراقبة (Uptime: {up})</div>
+</div></body></html>""", 200
     uid = get_dashboard_user(token)
 
     if not uid:
@@ -5922,6 +5990,14 @@ def run_web():
 # نقطة البداية
 # ============================================================
 if __name__ == "__main__":
+    if "--web-only" in sys.argv or os.environ.get("WEB_ONLY") == "1":
+        print("=" * 55)
+        print("HOST BOT v12.0 - DEMO WEB MONITORING ONLY (OK)")
+        print("=" * 55)
+        threading.Thread(target=keep_alive, daemon=True).start()
+        run_web()
+        sys.exit(0)
+
     print("=" * 55)
     print("HOST BOT v12.0 - STARTING")
     print("=" * 55)
