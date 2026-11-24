@@ -1288,6 +1288,29 @@ PER_PAGE = 8
 _btn_cache = {}
 _tpl_cache = {}
 _tpl_rx_cache = {}
+_pattern_cache = []
+
+
+def _rebuild_patterns():
+    _pattern_cache.clear()
+    for k, cfg in _btn_cache.items():
+        if "*" in k:
+            try:
+                rx = re.compile("^" + re.escape(k).replace(r"\*", ".*") + "$")
+                _pattern_cache.append((rx, cfg))
+            except Exception:
+                pass
+
+
+def _lookup_btn_cfg(key):
+    """تخصيص دقيق لهذا الزر بالذات أولاً، ثم تخصيص جماعي (إيموجي/لون) لعائلة الأزرار المتشابهة."""
+    exact = _btn_cache.get(key)
+    if exact:
+        return exact, True
+    for rx, cfg in _pattern_cache:
+        if rx.match(key):
+            return cfg, False
+    return None, False
 
 
 def _load_btn_cache():
@@ -1298,6 +1321,7 @@ def _load_btn_cache():
     _btn_cache.clear()
     for k, label, style, icon in rows:
         _btn_cache[k] = {"label": label, "style": style, "icon": icon}
+    _rebuild_patterns()
 
 
 def _load_tpl_cache():
@@ -1311,6 +1335,7 @@ def _load_tpl_cache():
 
 
 _load_btn_cache()
+_rebuild_patterns()
 _load_tpl_cache()
 
 
@@ -1322,6 +1347,7 @@ def set_btn_custom(key, **changes):
             c.execute(f"UPDATE btn_custom SET {field}=? WHERE bkey=?", (val, key))
         conn.commit(); conn.close()
     _load_btn_cache()
+    _rebuild_patterns()
 
 
 def reset_btn_custom(key):
@@ -1343,9 +1369,9 @@ _orig_btn = btn
 
 def btn(text, cb=None, url=None, style=None):
     key = cb if cb else (f"url:{url}" if url else f"txt:{text}")
-    cust = _btn_cache.get(key)
+    cust, is_exact = _lookup_btn_cfg(key)
     if cust:
-        if cust.get("label"):
+        if is_exact and cust.get("label"):
             text = cust["label"]
         if cust.get("icon"):
             text = _strip_lead(text)
@@ -1534,8 +1560,6 @@ def _scan_source(src):
                     key = "url:" + p
             elif "*" not in label:
                 key = "txt:" + label
-            if key and "*" in key:        # نمط عام يمثل عدة أزرار مختلفة فعلياً -> لا نعرضه للتخصيص الفردي
-                return None
             return key, label.replace("*", "…").strip() or "(زر)"
 
         def visit_List(self, node):
@@ -1587,7 +1611,15 @@ def _scan_source(src):
                                "btns": [], "rows": [], "tpls": []})
         return fid, funcs[fid]
 
+    groups = {}
+    _self_prefixes = ("pbtn_", "pgrp_", "ptpl_")
     for fn, key, label in v.buttons:
+        if "*" in key:
+            if key.startswith(_self_prefixes):
+                continue
+            g = groups.setdefault(key, {"key": key, "label": label.replace("*", "…"), "count": 0})
+            g["count"] += 1
+            continue
         bid = _ui_id(key, 8)
         fid, fo = fobj(fn)
         if bid not in buttons:
@@ -1626,7 +1658,7 @@ def _scan_source(src):
             fo["title"] = buttons[fo["btns"][0]]["label"][:30] or fo["name"]
         else:
             fo["title"] = fo["name"]
-    return {"funcs": funcs, "buttons": buttons, "bkeys": bkeys, "tpls": tpls}
+    return {"funcs": funcs, "buttons": buttons, "bkeys": bkeys, "tpls": tpls, "groups": groups}
 
 
 _PREMIUM_SELF_FUNCS = ('cb_pbtn', 'cb_ptpl', '_do_pbtn_input', '_do_ptpl_input', 'premium_main_menu', 'cb_premium_root', '_nav_row', 'cb_backup_ui', 'cb_restore_ui_prompt', '_do_restore_ui', 'cb_backup_db', 'cb_restore_db_prompt', '_do_restore_db', 'cb_restart_project', 'cb_restart_all', 'cb_restart_host_confirm', 'cb_restart_host_go', 'cb_files_v2', 'cb_file_view', 'cb_file_download', 'cb_file_delete_confirm', 'cb_file_delete_go', 'cb_env_editor', '_do_env_save', 'cb_toggle_pause', '_paused_message', '_paused_callback')
@@ -1861,8 +1893,29 @@ def cb_pbtn(call):
         for fid, fo in screens[page * PER_PAGE:(page + 1) * PER_PAGE]:
             tag = "👑" if fo["admin"] else "👤"
             rows.append([btn_blue(f"{tag} {fo['title']} ({len(fo['btns'])})", f"pbtn_scr_{fid}_0")])
+        rows.append([btn_green(f"🔁 أزرار متكررة ({len(sc['groups'])})", "pbtn_grp_0")])
         rows += _nav_row("pbtn_root", page, pages, "admin_premium")
-        txt = f"{make_header('🎛 اختر شاشة')}\n\nكل شاشة تعرض أزرارها بترتيبها الحقيقي — صفحة {page+1}/{pages}"
+        txt = (f"{make_header('🎛 تخصيص الأزرار')}\n\n"
+               "اختر شاشة فتظهر أزرارها بترتيبها الحقيقي، أو افتح «أزرار متكررة» لتخصيص أزرار تتكرر بأماكن كثيرة "
+               "(مثل حذف/تخطي/السابق) دفعة واحدة.\n\n"
+               f"صفحة {page+1}/{pages}")
+        m = types.InlineKeyboardMarkup(row_width=1)
+        for r in rows: m.row(*r)
+
+    elif act.startswith("pbtn_grp_"):
+        page = int(act.split("_")[2])
+        keys = sorted(sc["groups"].keys())
+        pages = max(1, (len(keys) + PER_PAGE - 1) // PER_PAGE)
+        page = max(0, min(page, pages - 1))
+        rows = []
+        for k in keys[page * PER_PAGE:(page + 1) * PER_PAGE]:
+            g = sc["groups"][k]
+            mark = "✨" if k in _btn_cache else "▫️"
+            rows.append([btn_blue(f"{mark} {g['label']} (×{g['count']})"[:42], f"pgrp_e_{_ui_id(k)}")])
+        rows += _nav_row("pbtn_grp", page, pages, "pbtn_root_0")
+        txt = (f"{make_header('🔁 أزرار متكررة')}\n\n"
+               "هذه أزرار تتكرر بأكثر من مكان (مثل حذف/تالي/سابق). تخصيصها هنا (إيموجي ولون فقط) "
+               f"يطبَّق على كل نسخها دفعة واحدة — صفحة {page+1}/{pages}")
         m = types.InlineKeyboardMarkup(row_width=1)
         for r in rows: m.row(*r)
 
@@ -1934,6 +1987,62 @@ def cb_pbtn(call):
         call.data = f"pbtn_e_{bid}"
         return cb_pbtn(call)
 
+    elif act.startswith("pgrp_e_"):
+        gid = call.data[len("pgrp_e_"):]
+        key = next((k for k in sc["groups"] if _ui_id(k) == gid), None)
+        if not key:
+            return cb_pbtn(types.SimpleNamespace(data="pbtn_grp_0", from_user=call.from_user, message=call.message))
+        g = sc["groups"][key]
+        cust = _btn_cache.get(key, {})
+        preview = btn(g["label"].replace("…", "…"), cb="noop")
+        txt = (
+            f"{make_header('🔁 ' + g['label'])}\n\n"
+            f"🔢 يتكرر في <code>{g['count']}</code> مكان\n"
+            f"🌈 اللون: {BTN_STYLE_NAMES.get(cust.get('style'), 'افتراضي')}\n"
+            f"🎨 الإيموجي: {'✨ مخصص' if cust.get('icon') else 'الافتراضي'}\n\n"
+            "معاينة (قد يختلف الاسم الحقيقي حسب المكان):"
+        )
+        m = types.InlineKeyboardMarkup(row_width=1)
+        m.add(preview)
+        m.add(btn_green("🎨 تخصيص الإيموجي", f"pgrp_i_{gid}"))
+        m.add(btn_blue("🌈 تخصيص اللون", f"pgrp_c_{gid}"))
+        m.add(btn_red("♻️ إعادة الافتراضي", f"pgrp_r_{gid}"))
+        m.add(btn_gray("🔙 رجوع", "pbtn_grp_0"))
+
+    elif act.startswith("pgrp_c_"):
+        gid = call.data[len("pgrp_c_"):]
+        m = types.InlineKeyboardMarkup(row_width=1)
+        for s in BTN_STYLES:
+            m.add(btn(BTN_STYLE_NAMES[s], f"pgrp_sc_{gid}_{s}", style=(s if s != "none" else None)))
+        m.add(btn_gray("🔙 رجوع", f"pgrp_e_{gid}"))
+        txt = f"{make_header('🌈 اختر اللون')}"
+
+    elif act.startswith("pgrp_sc_"):
+        rest = call.data[len("pgrp_sc_"):]
+        gid, style = rest.rsplit("_", 1)
+        key = next((k for k in sc["groups"] if _ui_id(k) == gid), None)
+        if key:
+            set_btn_custom(key, style=style)
+        call.data = f"pgrp_e_{gid}"
+        return cb_pbtn(call)
+
+    elif act.startswith("pgrp_r_"):
+        gid = call.data[len("pgrp_r_"):]
+        key = next((k for k in sc["groups"] if _ui_id(k) == gid), None)
+        if key:
+            reset_btn_custom(key)
+        call.data = f"pgrp_e_{gid}"
+        return cb_pbtn(call)
+
+    elif act.startswith("pgrp_i_"):
+        gid = call.data[len("pgrp_i_"):]
+        user_states[uid] = f"waiting_pgrp_i_{gid}"
+        m = types.InlineKeyboardMarkup()
+        m.add(btn_red("❌ الغاء", f"pgrp_e_{gid}"))
+        txt = f"{make_header('🎨 أرسل إيموجي مميز')}\n\nسيُطبَّق على كل الأزرار المشابهة دفعة واحدة."
+        bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=m, parse_mode="HTML")
+        return
+
     elif act.startswith(("pbtn_i_", "pbtn_n_", "pbtn_q_", "pbtn_batch_")):
         bid_or_fid = call.data.split("_", 2)[2]
         user_states[uid] = f"waiting_{act}_{bid_or_fid}"
@@ -1970,6 +2079,26 @@ def _entities_label_icon(message):
     out += data[pos * 2:]
     label = out.decode("utf-16-le", "ignore").strip()
     return icon, (label or None)
+
+
+@bot.message_handler(func=lambda m: user_states.get(m.from_user.id, "").startswith("waiting_pgrp_i_"))
+def _do_pgrp_input(msg):
+    uid = msg.from_user.id
+    if not is_admin(uid):
+        return
+    gid = user_states.pop(uid)[len("waiting_pgrp_i_"):]
+    sc = ui_scan()
+    key = next((k for k in sc["groups"] if _ui_id(k) == gid), None)
+    if not key:
+        return
+    icon, _ = _entities_label_icon(msg)
+    if not icon:
+        bot.reply_to(msg, "❌ لم أجد إيموجي مميزاً.")
+        user_states[uid] = f"waiting_pgrp_i_{gid}"
+        return
+    set_btn_custom(key, icon=icon)
+    bot.send_message(msg.chat.id, "✅ تم تطبيق الإيموجي على كل الأزرار المشابهة.",
+                    reply_markup=types.InlineKeyboardMarkup().add(btn_green("🔁 فتح المجموعة", f"pgrp_e_{gid}")))
 
 
 @bot.message_handler(func=lambda m: user_states.get(m.from_user.id, "").startswith("waiting_pbtn_"))
@@ -4181,8 +4310,8 @@ def cb_ui_edit(call):
 
     txt = (
         f"<b>✏️ تعديل:</b> <code>{key}</code>\n\n"
-        f"📄 القيمة الحالية:\n<code>{current}</code>\n\n"
-        "📤 ارسل القيمة الجديدة:"
+        f"📄 القيمة الحالية:\n<pre>{current}</pre>\n\n"
+        "📤 ارسل القيمة الجديدة (يدعم الإيموجي المميز والتنسيق):"
     )
 
     m = types.InlineKeyboardMarkup()
@@ -4203,10 +4332,13 @@ def do_ui_edit(msg):
         return
 
     key = user_states[msg.from_user.id].replace("waiting_ui_", "")
-    value = msg.text.strip()
+    value = _entities_to_html(msg.text or "", msg.entities).strip()
 
     if not value:
         bot.reply_to(msg, "❌ القيمة فاضية")
+        return
+    if len(value) > 3000:
+        bot.reply_to(msg, "❌ النص طويل جداً.")
         return
 
     set_ui(key, value)
