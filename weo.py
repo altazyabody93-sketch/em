@@ -4011,6 +4011,209 @@ def is_allowed_file(filename):
     return ext in ALLOWED_EXTS or basename in ALLOWED_FILENAMES
 
 
+
+# ============================================================
+# ✏️ تغيير اسم البوت + 🖼 تغيير صورة البوت (من لوحة المطور)
+# ============================================================
+def _tg_bot_api(method, json_data=None, data=None, files=None, timeout=25):
+    try:
+        import requests as req
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+        r = req.post(url, json=json_data, data=data, files=files, timeout=timeout)
+        try:
+            res = r.json()
+        except Exception:
+            return False, f"HTTP {r.status_code}: {r.text[:200]}"
+        if r.status_code == 200 and res.get("ok"):
+            return True, res.get("result")
+        return False, res.get("description") or f"HTTP {r.status_code}"
+    except Exception as e:
+        return False, str(e)[:200]
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "admin_bot_name")
+def cb_admin_bot_name(call):
+    uid = call.from_user.id
+    if not is_admin(uid):
+        bot.answer_callback_query(call.id, "🚫 غير مصرح", show_alert=True)
+        return
+
+    cur_name = "—"
+    ok, res = _tg_bot_api("getMyName", json_data={})
+    if ok and isinstance(res, dict) and res.get("name"):
+        cur_name = res["name"]
+    else:
+        try:
+            cur_name = bot.get_me().first_name or "—"
+        except Exception:
+            pass
+
+    user_states[uid] = "waiting_bot_name"
+    txt = (
+        f"{make_header('✏️ تغيير اسم البوت')}\n\n"
+        f"🤖 <b>الاسم الحالي:</b> <code>{html.escape(str(cur_name))}</code>\n\n"
+        "📤 أرسل الآن الاسم الجديد للبوت (من 1 إلى 64 حرفاً):"
+    )
+    m = types.InlineKeyboardMarkup()
+    m.add(btn_red("❌ إلغاء", "admin_panel"))
+    try:
+        bot.edit_message_text(txt, call.message.chat.id, call.message.message_id,
+                              reply_markup=m, parse_mode="HTML")
+    except Exception:
+        bot.send_message(call.message.chat.id, txt, reply_markup=m, parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: not (m.text or "").startswith("/") and user_states.get(m.from_user.id) == "waiting_bot_name")
+def do_bot_name(msg):
+    uid = msg.from_user.id
+    if not is_admin(uid):
+        return
+    new_name = (msg.text or "").strip()
+    if not new_name or len(new_name) > 64:
+        bot.reply_to(msg, "❌ الاسم يجب أن يكون بين 1 و 64 حرفاً.")
+        return
+
+    ok, res = _tg_bot_api("setMyName", json_data={"name": new_name})
+    if ok:
+        user_states.pop(uid, None)
+        log_action(uid, "change_bot_name", new_name)
+        m = types.InlineKeyboardMarkup()
+        m.add(btn_gray("🔙 رجوع للوحة المطور", "admin_panel"))
+        bot.reply_to(
+            msg,
+            f"✅ <b>تم تغيير اسم البوت بنجاح!</b>\n\n🤖 الاسم الجديد: <code>{html.escape(new_name)}</code>",
+            parse_mode="HTML",
+            reply_markup=m,
+        )
+    else:
+        bot.reply_to(msg, f"❌ فشل تغيير اسم البوت:\n<code>{html.escape(str(res))}</code>", parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "admin_bot_photo")
+def cb_admin_bot_photo(call):
+    uid = call.from_user.id
+    if not is_admin(uid):
+        bot.answer_callback_query(call.id, "🚫 غير مصرح", show_alert=True)
+        return
+
+    user_states[uid] = "waiting_bot_photo"
+    txt = (
+        f"{make_header('🖼 تغيير صورة البوت')}\n\n"
+        "📤 أرسل الآن الصورة الجديدة للبوت:\n"
+        "  • صورة مباشرة من المعرض\n"
+        "  • أو ملف صورة (JPG / PNG)\n"
+        "  • أو فيديو MP4 قصير (حتى 5 ثوانٍ)\n"
+    )
+    m = types.InlineKeyboardMarkup(row_width=1)
+    m.add(btn_red("🗑 حذف صورة البوت الحالية", "admin_bot_photo_remove"))
+    m.add(btn_gray("❌ إلغاء", "admin_panel"))
+    try:
+        bot.edit_message_text(txt, call.message.chat.id, call.message.message_id,
+                              reply_markup=m, parse_mode="HTML")
+    except Exception:
+        bot.send_message(call.message.chat.id, txt, reply_markup=m, parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "admin_bot_photo_remove")
+def cb_admin_bot_photo_remove(call):
+    uid = call.from_user.id
+    if not is_admin(uid):
+        bot.answer_callback_query(call.id, "🚫 غير مصرح", show_alert=True)
+        return
+
+    user_states.pop(uid, None)
+    ok, res = _tg_bot_api("removeMyProfilePhoto", json_data={})
+    if ok:
+        log_action(uid, "remove_bot_photo", "")
+        bot.answer_callback_query(call.id, "✅ تم حذف صورة البوت", show_alert=True)
+        cb_admin(call)
+    else:
+        bot.answer_callback_query(call.id, f"❌ فشل الحذف: {str(res)[:120]}", show_alert=True)
+
+
+@bot.message_handler(
+    func=lambda m: user_states.get(m.from_user.id) == "waiting_bot_photo",
+    content_types=['photo', 'document', 'animation', 'video']
+)
+def do_bot_photo(msg):
+    uid = msg.from_user.id
+    if not is_admin(uid):
+        return
+
+    try:
+        is_animated = False
+        file_bytes = None
+
+        if msg.photo:
+            fi = bot.get_file(msg.photo[-1].file_id)
+            file_bytes = bot.download_file(fi.file_path)
+        elif msg.animation or msg.video:
+            media = msg.animation or msg.video
+            if getattr(media, "file_size", 0) and media.file_size > 10 * 1024 * 1024:
+                bot.reply_to(msg, "❌ حجم الملف كبير جداً (الحد 10 MB).")
+                return
+            fi = bot.get_file(media.file_id)
+            file_bytes = bot.download_file(fi.file_path)
+            is_animated = True
+        elif msg.document:
+            fname = (msg.document.file_name or "").lower()
+            mime = (msg.document.mime_type or "").lower()
+            if msg.document.file_size and msg.document.file_size > 10 * 1024 * 1024:
+                bot.reply_to(msg, "❌ حجم الملف كبير جداً (الحد 10 MB).")
+                return
+            fi = bot.get_file(msg.document.file_id)
+            raw_bytes = bot.download_file(fi.file_path)
+            if fname.endswith(".mp4") or mime == "video/mp4":
+                file_bytes = raw_bytes
+                is_animated = True
+            elif fname.endswith((".jpg", ".jpeg")) or mime in ("image/jpeg", "image/jpg"):
+                file_bytes = raw_bytes
+            elif fname.endswith((".png", ".webp", ".bmp")) or mime.startswith("image/"):
+                try:
+                    from PIL import Image
+                    im = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+                    buf = io.BytesIO()
+                    im.save(buf, format="JPEG", quality=92)
+                    file_bytes = buf.getvalue()
+                except ImportError:
+                    bot.reply_to(msg, "⚠️ أرسل الصورة كصورة عادية (Photo) أو بصيغة JPG.")
+                    return
+            else:
+                bot.reply_to(msg, "❌ صيغة غير مدعومة. أرسل صورة JPG/PNG أو فيديو MP4.")
+                return
+        else:
+            bot.reply_to(msg, "❌ أرسل صورة صالحة.")
+            return
+
+        if is_animated:
+            payload = {"photo": json.dumps({"type": "animated", "animation": "attach://avatar"})}
+            files = {"avatar": ("avatar.mp4", file_bytes, "video/mp4")}
+        else:
+            payload = {"photo": json.dumps({"type": "static", "photo": "attach://avatar"})}
+            files = {"avatar": ("avatar.jpg", file_bytes, "image/jpeg")}
+
+        ok, res = _tg_bot_api("setMyProfilePhoto", data=payload, files=files, timeout=30)
+        if ok:
+            user_states.pop(uid, None)
+            log_action(uid, "change_bot_photo", "animated" if is_animated else "static")
+            m = types.InlineKeyboardMarkup()
+            m.add(btn_gray("🔙 رجوع للوحة المطور", "admin_panel"))
+            bot.reply_to(
+                msg,
+                "✅ <b>تم تغيير صورة البوت بنجاح!</b>",
+                parse_mode="HTML",
+                reply_markup=m,
+            )
+        else:
+            bot.reply_to(
+                msg,
+                f"❌ فشل تغيير صورة البوت:\n<code>{html.escape(str(res))}</code>",
+                parse_mode="HTML",
+            )
+    except Exception as e:
+        bot.reply_to(msg, f"❌ خطأ: <code>{html.escape(str(e)[:200])}</code>", parse_mode="HTML")
+
+
 @bot.message_handler(content_types=['document'])
 def handle_doc(msg):
     uid = msg.from_user.id
@@ -4552,6 +4755,8 @@ def cb_admin(call):
     if not is_admin(uid):
         bot.answer_callback_query(call.id, "🚫 غير مصرح", show_alert=True)
         return
+    if user_states.get(uid) in ("waiting_bot_name", "waiting_bot_photo"):
+        user_states.pop(uid, None)
 
     projs = get_all_projects()
     running = sum(1 for p in projs if is_running(p[0]))
@@ -4578,6 +4783,7 @@ def cb_admin(call):
     m.row(btn_blue("📋 سجل الاحداث", "admin_logs"), btn_green("🔓 فك حظر", "admin_unban"))
     mode_lbl = "💰 الوضع: مدفوع 💎" if is_paid_mode() else "🆓 الوضع: مجاني"
     m.row(btn_green("🎨 تخصيص البوت (أزرار + نصوص + نسخ)", "admin_premium"))
+    m.row(btn_blue("✏️ تغيير اسم البوت", "admin_bot_name"), btn_blue("🖼 تغيير صورة البوت", "admin_bot_photo"))
     m.row(btn_blue("💽 نسخة DB كاملة", "admin_backup_db"), btn_blue("📥 استعادة DB كاملة", "admin_restore_db"))
     m.row(btn_blue("🔁 إعادة تشغيل الكل", "admin_restart_all"), btn_red("♻️ إعادة تشغيل الاستضافة", "admin_restart_host"))
     m.row(btn(f"{'▶️ تشغيل الاستضافة' if host_paused() else '⏸ إيقاف الاستضافة'}", "admin_toggle_pause",
