@@ -1265,6 +1265,7 @@ bot = telebot.TeleBot(BOT_TOKEN)
 # 💎 الحزمة الاحترافية: تخصيص شامل + صيانة + ملفات + إعادة تشغيل
 # (كل شيء هنا إضافي؛ لا يحذف أو يعطّل أي ميزة سابقة)
 # ============================================================
+import io
 import string as _string
 import ast as _ast
 
@@ -1804,14 +1805,17 @@ def _paused_callback(c):
 # ============================================================
 def premium_main_menu(call_or_uid):
     uid = call_or_uid if isinstance(call_or_uid, int) else call_or_uid.from_user.id
+    nb, nt = len(_btn_cache), len(_tpl_cache)
     txt = (
-        f"{make_header('💎 لوحة التخصيص الاحترافية')}\n\n"
+        f"{make_header('🎨 تخصيص البوت')}\n\n"
+        f"🔘 أزرار معدّلة: <code>{nb}</code> · 📝 نصوص معدّلة: <code>{nt}</code>\n\n"
         "اختر ما تريد تخصيصه:"
     )
     m = types.InlineKeyboardMarkup(row_width=1)
-    m.add(btn_green("🎛 تخصيص كل الأزرار (إيموجي + اسم + لون)", "pbtn_root"))
-    m.add(btn_green("📝 تخصيص كل النصوص (انسخ ← عدّل ← أرسل)", "ptpl_root"))
-    m.add(btn_blue("📏 خط الفاصل ونصوص عامة", "admin_ui"))
+    m.add(btn_green("🎛 تخصيص الأزرار (إيموجي + اسم + لون)", "pbtn_root"))
+    m.add(btn_green("📝 تخصيص النصوص (انسخ ← عدّل ← أرسل)", "ptpl_root"))
+    m.add(btn_blue("⚙️ إعدادات نصية عامة (ترحيب/فاصل/صيانة)", "admin_ui"))
+    m.row(btn_blue("💾 نسخة احتياطية للتخصيص", "admin_backup_ui"), btn_blue("📥 استعادة التخصيص", "admin_restore_ui"))
     m.add(btn_gray("🔙 رجوع", "admin_panel"))
     return txt, m
 
@@ -3994,11 +3998,10 @@ def cb_admin(call):
     m = types.InlineKeyboardMarkup(row_width=2)
     m.row(btn_red("📢 اعلان", "broadcast"), btn_blue("📊 احصائيات", "admin_stats"))
     m.row(btn_blue("👥 المستخدمين", "admin_users"), btn_blue("📦 المشاريع", "admin_projs"))
-    m.row(btn_green("📝 النصوص", "admin_ui"), btn_blue("🔗 Tunnel", "admin_tunnel"))
+    m.row(btn_blue("🔗 Tunnel", "admin_tunnel"), btn_blue("📥 تخزين المطوّر", "admin_storage_0"))
     m.row(btn_blue("📋 سجل الاحداث", "admin_logs"), btn_green("🔓 فك حظر", "admin_unban"))
-    m.row(btn_blue("📥 تخزين المطوّر", "admin_storage_0"), btn_green("🎨 تعديل الازرار", "admin_buttons"))
-    m.row(btn_green("💎 اللوحة الاحترافية (أزرار+نصوص+نسخ)", "admin_premium"))
-    m.row(btn_blue("💽 نسخة DB", "admin_backup_db"), btn_blue("📥 استعادة DB", "admin_restore_db"))
+    m.row(btn_green("🎨 تخصيص البوت (أزرار + نصوص + نسخ)", "admin_premium"))
+    m.row(btn_blue("💽 نسخة DB كاملة", "admin_backup_db"), btn_blue("📥 استعادة DB كاملة", "admin_restore_db"))
     m.row(btn_blue("🔁 إعادة تشغيل الكل", "admin_restart_all"), btn_red("♻️ إعادة تشغيل الاستضافة", "admin_restart_host"))
     m.row(btn(f"{'▶️ تشغيل الاستضافة' if host_paused() else '⏸ إيقاف الاستضافة'}", "admin_toggle_pause",
              style="success" if host_paused() else "danger"))
