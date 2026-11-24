@@ -10,6 +10,7 @@
 import os, sys, json, time, shutil, signal, sqlite3, subprocess
 import threading, socket, re, random, zipfile, platform, urllib.request
 import secrets, ast, html
+from types import SimpleNamespace
 from datetime import datetime, timedelta
 
 import telebot
@@ -2298,7 +2299,7 @@ def cb_pbtn(call):
         gid = call.data[len("pgrp_e_"):]
         key = next((k for k in sc["groups"] if _ui_id(k) == gid), None)
         if not key:
-            return cb_pbtn(types.SimpleNamespace(data="pbtn_grp_0", from_user=call.from_user, message=call.message))
+            return cb_pbtn(SimpleNamespace(data="pbtn_grp_0", from_user=call.from_user, message=call.message))
         g = sc["groups"][key]
         cust = _btn_cache.get(key, {})
         preview = btn(g["label"].replace("…", "…"), cb="noop")
@@ -2389,7 +2390,7 @@ def _entities_label_icon(message):
     return icon, (label or None)
 
 
-@bot.message_handler(func=lambda m: user_states.get(m.from_user.id, "").startswith("waiting_pgrp_i_"))
+@bot.message_handler(func=lambda m: not (m.text or "").startswith("/") and user_states.get(m.from_user.id, "").startswith("waiting_pgrp_i_"))
 def _do_pgrp_input(msg):
     uid = msg.from_user.id
     if not is_admin(uid):
@@ -2409,7 +2410,7 @@ def _do_pgrp_input(msg):
                     reply_markup=types.InlineKeyboardMarkup().add(btn_green("🔁 فتح المجموعة", f"pgrp_e_{gid}")))
 
 
-@bot.message_handler(func=lambda m: user_states.get(m.from_user.id, "").startswith("waiting_pbtn_"))
+@bot.message_handler(func=lambda m: not (m.text or "").startswith("/") and user_states.get(m.from_user.id, "").startswith("waiting_pbtn_"))
 def _do_pbtn_input(msg):
     uid = msg.from_user.id
     if not is_admin(uid):
@@ -2466,8 +2467,8 @@ def _do_pbtn_input(msg):
             if not ch:
                 bot.reply_to(msg, "❌ أرسل إيموجي مميزاً و/أو اسماً."); user_states[uid] = state; return
             set_btn_custom(b["key"], **ch)
-        call = types.SimpleNamespace(data=f"pbtn_e_{bid}", from_user=msg.from_user,
-                                     message=types.SimpleNamespace(chat=msg.chat, message_id=None))
+        call = SimpleNamespace(data=f"pbtn_e_{bid}", from_user=msg.from_user,
+                                     message=SimpleNamespace(chat=msg.chat, message_id=None))
         txt = f"✅ تم الحفظ.\n\nافتح الزر مجدداً لمشاهدة الشكل الجديد."
         bot.send_message(msg.chat.id, txt, reply_markup=types.InlineKeyboardMarkup().add(btn_green("🎛 فتح الزر", f"pbtn_e_{bid}")))
     except Exception as e:
@@ -2504,7 +2505,7 @@ def cb_ptpl(call):
         page = int(page)
         fo = sc["funcs"].get(fid)
         if not fo:
-            return cb_ptpl(types.SimpleNamespace(data="ptpl_root", from_user=call.from_user, message=call.message))
+            return cb_ptpl(SimpleNamespace(data="ptpl_root", from_user=call.from_user, message=call.message))
         pages = max(1, (len(fo["tpls"]) + PER_PAGE - 1) // PER_PAGE)
         page = max(0, min(page, pages - 1))
         m = types.InlineKeyboardMarkup(row_width=1)
@@ -2519,7 +2520,7 @@ def cb_ptpl(call):
         tid = data[len("ptpl_v_"):]
         info = sc["tpls"].get(tid)
         if not info:
-            return cb_ptpl(types.SimpleNamespace(data="ptpl_root", from_user=call.from_user, message=call.message))
+            return cb_ptpl(SimpleNamespace(data="ptpl_root", from_user=call.from_user, message=call.message))
         shown = _tpl_cache.get(tid) or _tpl_text(info["parts"])
         legend = "  ".join("{" + n + "}" for n in info["names"]) or "لا يوجد"
         txt = (
@@ -2586,7 +2587,7 @@ def _entities_to_html(text, entities):
     return "".join(out)
 
 
-@bot.message_handler(func=lambda m: user_states.get(m.from_user.id, "").startswith("waiting_ptpl_"))
+@bot.message_handler(func=lambda m: not (m.text or "").startswith("/") and user_states.get(m.from_user.id, "").startswith("waiting_ptpl_"))
 def _do_ptpl_input(msg):
     uid = msg.from_user.id
     if not is_admin(uid):
@@ -3162,6 +3163,7 @@ def main_menu(uid):
 @bot.message_handler(commands=['start'])
 def cmd_start(msg):
     uid = msg.from_user.id
+    user_states.pop(uid, None)
 
     if is_banned(uid):
         bot.send_message(msg.chat.id, "🚫 انت محظور من استخدام البوت",
