@@ -1261,6 +1261,1369 @@ def keep_alive():
 # ============================================================
 bot = telebot.TeleBot(BOT_TOKEN)
 
+# ============================================================
+# 💎 الحزمة الاحترافية: تخصيص شامل + صيانة + ملفات + إعادة تشغيل
+# (كل شيء هنا إضافي؛ لا يحذف أو يعطّل أي ميزة سابقة)
+# ============================================================
+import string as _string
+import ast as _ast
+
+with DB_LOCK:
+    _c = _conn()
+    _c.execute("CREATE TABLE IF NOT EXISTS btn_custom (bkey TEXT PRIMARY KEY, label TEXT, style TEXT, icon TEXT)")
+    _c.execute("CREATE TABLE IF NOT EXISTS tpl_custom (tid TEXT PRIMARY KEY, text TEXT)")
+    _c.commit(); _c.close()
+
+DEFAULT_UI.setdefault("divider_line", "━━━━━━━━━━━━━━━━━━━━━━━━━")
+DEFAULT_UI.setdefault("maintenance_text",
+    "🛠 <b>الاستضافة متوقفة مؤقتاً للصيانة</b>\n\nراجعنا بعد قليل 🙏")
+UI_TEMPLATES["divider_line"] = "📏 خط الفاصل الزخرفي (يغيّر شكل كل الشاشات دفعة واحدة)"
+UI_TEMPLATES["maintenance_text"] = "📝 نص شاشة الصيانة"
+
+BTN_STYLES = ("primary", "success", "danger", "none")
+BTN_STYLE_NAMES = {"primary": "🔵 أزرق", "success": "🟢 أخضر", "danger": "🔴 أحمر", "none": "⚪ بدون"}
+PER_PAGE = 8
+
+_btn_cache = {}
+_tpl_cache = {}
+_tpl_rx_cache = {}
+
+
+def _load_btn_cache():
+    with DB_LOCK:
+        conn = _conn(); c = conn.cursor()
+        c.execute("SELECT bkey, label, style, icon FROM btn_custom")
+        rows = c.fetchall(); conn.close()
+    _btn_cache.clear()
+    for k, label, style, icon in rows:
+        _btn_cache[k] = {"label": label, "style": style, "icon": icon}
+
+
+def _load_tpl_cache():
+    with DB_LOCK:
+        conn = _conn(); c = conn.cursor()
+        c.execute("SELECT tid, text FROM tpl_custom")
+        rows = c.fetchall(); conn.close()
+    _tpl_cache.clear()
+    _tpl_cache.update(dict(rows))
+    _tpl_rx_cache.clear()
+
+
+_load_btn_cache()
+_load_tpl_cache()
+
+
+def set_btn_custom(key, **changes):
+    with DB_LOCK:
+        conn = _conn(); c = conn.cursor()
+        c.execute("INSERT OR IGNORE INTO btn_custom (bkey) VALUES (?)", (key,))
+        for field, val in changes.items():
+            c.execute(f"UPDATE btn_custom SET {field}=? WHERE bkey=?", (val, key))
+        conn.commit(); conn.close()
+    _load_btn_cache()
+
+
+def reset_btn_custom(key):
+    with DB_LOCK:
+        conn = _conn(); c = conn.cursor()
+        c.execute("DELETE FROM btn_custom WHERE bkey=?", (key,))
+        conn.commit(); conn.close()
+    _load_btn_cache()
+
+
+def _strip_lead(text):
+    s = re.sub(r'^[^\w\u0600-\u06FF]+', '', str(text or '')).strip()
+    return s or text
+
+
+# ---------- وسم الزر الأصلي (قبل أي تخصيص) ليُستخدم في الفحص والمعاينة ----------
+_orig_btn = btn
+
+
+def btn(text, cb=None, url=None, style=None):
+    key = cb if cb else (f"url:{url}" if url else f"txt:{text}")
+    cust = _btn_cache.get(key)
+    if cust:
+        if cust.get("label"):
+            text = cust["label"]
+        if cust.get("icon"):
+            text = _strip_lead(text)
+        if cust.get("style"):
+            style = None if cust["style"] == "none" else cust["style"]
+    b = _orig_btn(text, cb=cb, url=url, style=style)
+    if cust and cust.get("icon"):
+        try:
+            b.icon_custom_emoji_id = cust["icon"]
+        except Exception:
+            pass
+    return b
+
+
+# شبكة أمان: تضمن ظهور style/icon_custom_emoji_id في JSON حتى لو كانت نسخة telebot
+# المثبّتة لا تدعمهما أصلاً كحقول بنّاء (إضافي بحت، لا يغيّر أي سلوك موجود وفعّال).
+try:
+    _orig_ikb_to_dict = types.InlineKeyboardButton.to_dict
+
+    def _patched_ikb_to_dict(self):
+        d = _orig_ikb_to_dict(self)
+        st = getattr(self, "style", None)
+        if st and "style" not in d:
+            d["style"] = st
+        ic = getattr(self, "icon_custom_emoji_id", None)
+        if ic and "icon_custom_emoji_id" not in d:
+            d["icon_custom_emoji_id"] = ic
+        return d
+    types.InlineKeyboardButton.to_dict = _patched_ikb_to_dict
+except Exception as _e:
+    print(f"[UI] تعذّر تفعيل شبكة أمان الأزرار: {_e}")
+
+
+# ============================================================
+# 🧠 مسح الكود: استخراج كل الأزرار + كل نصوص الرسائل (بترتيبها الحقيقي)
+# ============================================================
+_BTN_FUNCS = {"btn_green": "success", "btn_red": "danger", "btn_blue": "primary", "btn_gray": None}
+
+
+def _ui_pat_of(node, env, depth=0):
+    """نص تقريبي لأي تعبير (ثابت/f-string/متغير محلي)، بنجمة * للأجزاء المتغيرة."""
+    if node is None or depth > 6:
+        return None
+    if isinstance(node, _ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, _ast.JoinedStr):
+        out = ""
+        for part in node.values:
+            if isinstance(part, _ast.Constant):
+                out += str(part.value)
+            else:
+                r = _ui_pat_of(getattr(part, "value", None), env, depth + 1)
+                out += r if r is not None else "*"
+        return out
+    if isinstance(node, _ast.Name):
+        return _ui_pat_of(env.get(node.id), env, depth + 1) if node.id in env else None
+    if isinstance(node, _ast.IfExp):
+        return _ui_pat_of(node.body, env, depth + 1)
+    if isinstance(node, _ast.BinOp) and isinstance(node.op, _ast.Add):
+        l, r = _ui_pat_of(node.left, env, depth + 1), _ui_pat_of(node.right, env, depth + 1)
+        if l is None and r is None:
+            return None
+        return (l if l is not None else "*") + (r if r is not None else "*")
+    return None
+
+
+def _tparts(node, env, depth=0):
+    """تفكيك تعبير نصي إلى أجزاء [('s', ثابت) | ('p', تعبير)]."""
+    if node is None or depth > 8:
+        return [("p", None)]
+    if isinstance(node, _ast.Constant) and isinstance(node.value, str):
+        return [("s", node.value)]
+    if isinstance(node, _ast.JoinedStr):
+        out = []
+        for part in node.values:
+            if isinstance(part, _ast.Constant):
+                out.append(("s", str(part.value)))
+            else:
+                out.append(("p", getattr(part, "value", None)))
+        return out
+    if isinstance(node, _ast.BinOp) and isinstance(node.op, _ast.Add):
+        return _tparts(node.left, env, depth + 1) + _tparts(node.right, env, depth + 1)
+    if isinstance(node, _ast.Name):
+        return list(env[node.id]) if node.id in env else [("p", node)]
+    if isinstance(node, _ast.IfExp):
+        return _tparts(node.body, env, depth + 1)
+    return [("p", node)]
+
+
+def _ph_name(node, used):
+    base = "v"
+    if isinstance(node, _ast.Name):
+        base = node.id
+    elif isinstance(node, _ast.Attribute):
+        base = node.attr
+    elif isinstance(node, _ast.Call):
+        if isinstance(node.func, _ast.Name):
+            base = node.func.id
+        elif isinstance(node.func, _ast.Attribute):
+            base = node.func.attr
+    base = re.sub(r"\W", "_", str(base)) or "v"
+    name, i = base, 2
+    while name in used:
+        name, i = f"{base}_{i}", i + 1
+    used.add(name)
+    return name
+
+
+def _clean_title(s):
+    return re.sub(r"[*`_]+", "", re.sub(r"\s+", " ", str(s))).strip()
+
+
+_ui_id = lambda s, n=10: hashlib.md5(str(s).encode("utf-8")).hexdigest()[:n] if False else None
+import hashlib as _hashlib
+
+
+def _ui_id(s, n=10):
+    return _hashlib.md5(str(s).encode("utf-8")).hexdigest()[:n]
+
+
+_SCAN = {"mtime": 0, "data": None}
+
+
+def _scan_source(src):
+    tree = _ast.parse(src)
+
+    class V(_ast.NodeVisitor):
+        def __init__(self):
+            self.func = ["_module"]
+            self.assigns = [{}]
+            self.tenv = [{}]
+            self.buttons = []   # (func, key, label)
+            self.rows = []      # (func, [key,...])
+            self.tpls = []      # (func, parts)
+
+        def visit_FunctionDef(self, node):
+            self.func.append(node.name)
+            self.assigns.append({}); self.tenv.append({})
+            self.generic_visit(node)
+            self.tenv.pop(); self.assigns.pop()
+            self.func.pop()
+        visit_AsyncFunctionDef = visit_FunctionDef
+
+        def visit_Assign(self, node):
+            for tg in node.targets:
+                if isinstance(tg, _ast.Name):
+                    self.assigns[-1][tg.id] = node.value
+                    self.tenv[-1][tg.id] = _tparts(node.value, self.tenv[-1])
+            self.generic_visit(node)
+
+        def visit_AugAssign(self, node):
+            if isinstance(node.target, _ast.Name):
+                cur = self.tenv[-1].get(node.target.id, [("p", node.target)])
+                self.tenv[-1][node.target.id] = cur + _tparts(node.value, self.tenv[-1])
+            self.generic_visit(node)
+
+        def _btn_info(self, call):
+            f = call.func
+            fname = f.id if isinstance(f, _ast.Name) else (f.attr if isinstance(f, _ast.Attribute) else "")
+            if fname not in ("btn_green", "btn_red", "btn_blue", "btn_gray", "btn", "make_custom_btn"):
+                return None
+            kws = {k.arg: k.value for k in call.keywords if k.arg}
+            if fname == "make_custom_btn":
+                if not call.args or not isinstance(call.args[0], _ast.Constant):
+                    return None
+                dkey = call.args[0].value
+                label = DEFAULT_BUTTONS.get(dkey, (dkey,))[0]
+                cb_node = call.args[1] if len(call.args) > 1 else kws.get("cb")
+                url_node = kws.get("url")
+            else:
+                text_node = call.args[0] if call.args else kws.get("text") or kws.get("t")
+                label = _ui_pat_of(text_node, self.tenv[-1]) or "(متغير)"
+                cb_node = call.args[1] if fname == "btn" and len(call.args) > 1 else \
+                    (call.args[1] if fname != "btn" and len(call.args) > 1 else kws.get("cb"))
+                url_node = kws.get("url")
+                if fname != "btn" and len(call.args) <= 1:
+                    cb_node = kws.get("cb")
+            key = None
+            if cb_node is not None:
+                p = _ui_pat_of(cb_node, self.tenv[-1])
+                if p and not p.startswith("*") and re.search(r"[A-Za-z_]{3}", p):
+                    key = p
+            elif url_node is not None:
+                p = _ui_pat_of(url_node, self.tenv[-1])
+                if p and "*" not in p:
+                    key = "url:" + p
+            elif "*" not in label:
+                key = "txt:" + label
+            if key and "*" in key:        # نمط عام يمثل عدة أزرار مختلفة فعلياً -> لا نعرضه للتخصيص الفردي
+                return None
+            return key, label.replace("*", "…").strip() or "(زر)"
+
+        def visit_List(self, node):
+            infos = [self._btn_info(e) if isinstance(e, _ast.Call) else None for e in node.elts]
+            if node.elts and all(i is not None for i in infos):
+                keys = [i[0] for i in infos if i[0]]
+                if keys:
+                    self.rows.append((self.func[-1], keys))
+            self.generic_visit(node)
+
+        def _record_tpl(self, arg):
+            merged, used = [], set()
+            for kind, val in _tparts(arg, self.tenv[-1]):
+                if kind == "s":
+                    if merged and merged[-1][0] == "s":
+                        merged[-1] = ("s", merged[-1][1] + val)
+                    else:
+                        merged.append(("s", val))
+                else:
+                    merged.append(("p", _ph_name(val, used)))
+            static = "".join(v for k, v in merged if k == "s")
+            if len(static.strip()) < 15 or len(re.findall(r"[\u0600-\u06FFA-Za-z]", static)) < 6:
+                return
+            if sum(1 for k, _ in merged if k == "p") > 16:
+                return
+            self.tpls.append((self.func[-1], merged))
+
+        def visit_Call(self, node):
+            f = node.func
+            fname = f.id if isinstance(f, _ast.Name) else (f.attr if isinstance(f, _ast.Attribute) else "")
+            info = self._btn_info(node) if isinstance(node, _ast.Call) else None
+            if info and info[0]:
+                self.buttons.append((self.func[-1], info[0], info[1]))
+            if fname == "edit_message_text" and node.args:
+                self._record_tpl(node.args[0])
+            elif fname == "send_message" and len(node.args) > 1:
+                self._record_tpl(node.args[1])
+            elif fname == "reply_to" and len(node.args) > 1:
+                self._record_tpl(node.args[1])
+            self.generic_visit(node)
+
+    v = V(); v.visit(tree)
+
+    funcs, buttons, bkeys, tpls = {}, {}, {}, {}
+
+    def fobj(name):
+        fid = _ui_id(name, 8)
+        funcs.setdefault(fid, {"name": name, "title": "", "admin": name.startswith(("cb_admin", "admin_", "do_ui", "cb_edit_btn", "cb_chg")) or "admin" in name,
+                               "btns": [], "rows": [], "tpls": []})
+        return fid, funcs[fid]
+
+    for fn, key, label in v.buttons:
+        bid = _ui_id(key, 8)
+        fid, fo = fobj(fn)
+        if bid not in buttons:
+            buttons[bid] = {"key": key, "label": label, "fid": fid}
+            bkeys[key] = bid
+        if bid not in fo["btns"]:
+            fo["btns"].append(bid)
+    for fn, keys in v.rows:
+        fo = fobj(fn)[1]
+        row = [bkeys[k] for k in keys if k in bkeys]
+        if row:
+            fo["rows"].append(row)
+    for fid, fo in funcs.items():
+        placed = {b for r in fo["rows"] for b in r}
+        order = list(placed)
+        for b in fo["btns"]:
+            if b not in placed:
+                order.append(b)
+        fo["btns"] = order or fo["btns"]
+
+    for fn, parts in v.tpls:
+        canon = "|".join(("S:" + x) if k == "s" else ("P:" + x) for k, x in parts)
+        tid = _ui_id(canon, 10)
+        if tid in tpls:
+            continue
+        fid, fo = fobj(fn)
+        names = [x for k, x in parts if k == "p"]
+        prev = _clean_title("".join(x for k, x in parts if k == "s"))[:40]
+        tpls[tid] = {"parts": parts, "fid": fid, "names": names, "preview": prev}
+        fo["tpls"].append(tid)
+
+    for fid, fo in funcs.items():
+        if fo["tpls"]:
+            fo["title"] = tpls[fo["tpls"][0]]["preview"][:30] or fo["name"]
+        elif fo["btns"]:
+            fo["title"] = buttons[fo["btns"][0]]["label"][:30] or fo["name"]
+        else:
+            fo["title"] = fo["name"]
+    return {"funcs": funcs, "buttons": buttons, "bkeys": bkeys, "tpls": tpls}
+
+
+_PREMIUM_SELF_FUNCS = ('cb_pbtn', 'cb_ptpl', '_do_pbtn_input', '_do_ptpl_input', 'premium_main_menu', 'cb_premium_root', '_nav_row', 'cb_backup_ui', 'cb_restore_ui_prompt', '_do_restore_ui', 'cb_backup_db', 'cb_restore_db_prompt', '_do_restore_db', 'cb_restart_project', 'cb_restart_all', 'cb_restart_host_confirm', 'cb_restart_host_go', 'cb_files_v2', 'cb_file_view', 'cb_file_download', 'cb_file_delete_confirm', 'cb_file_delete_go', 'cb_env_editor', '_do_env_save', 'cb_toggle_pause', '_paused_message', '_paused_callback')
+
+
+def ui_scan():
+    path = os.path.abspath(__file__)
+    mt = os.path.getmtime(path)
+    if _SCAN["data"] is not None and _SCAN["mtime"] == mt:
+        return _SCAN["data"]
+    with open(path, encoding="utf-8") as fh:
+        data = _scan_source(fh.read())
+    _SCAN.update(mtime=mt, data=data)
+    return data
+
+
+def _tpl_text(parts):
+    return "".join(v.replace("{", "{{").replace("}", "}}") if k == "s" else "{" + v + "}" for k, v in parts)
+
+
+def _render_tpl(custom, vals):
+    def _r(m):
+        s = m.group(0)
+        if s == "{{": return "{"
+        if s == "}}": return "}"
+        return str(vals.get(m.group(1), s))
+    return re.sub(r"\{\{|\}\}|\{(\w+)\}", _r, custom)
+
+
+def _tpl_regex(parts):
+    rx, names = "", []
+    for kind, v in parts:
+        if kind == "s":
+            rx += re.escape(v)
+        else:
+            rx += "(.*?)"; names.append(v)
+    return re.compile("^" + rx + "$", re.S), names
+
+
+def apply_templates(text):
+    if not _tpl_cache or not isinstance(text, str):
+        return text
+    for tid, new_text in list(_tpl_cache.items()):
+        rx = _tpl_rx_cache.get(tid)
+        if rx is None:
+            info = ui_scan()["tpls"].get(tid)
+            if not info:
+                continue
+            rx = _tpl_rx_cache[tid] = _tpl_regex(info["parts"])
+        m = rx[0].match(text)
+        if m:
+            return _render_tpl(new_text, dict(zip(rx[1], m.groups())))
+    return text
+
+
+def apply_divider(text):
+    if not isinstance(text, str):
+        return text
+    custom = get_ui("divider_line")
+    default = DEFAULT_UI["divider_line"]
+    if custom and custom != default:
+        text = text.replace(default, custom)
+    return text
+
+
+def apply_cosmetics(text):
+    return apply_divider(apply_templates(text))
+
+
+# ============================================================
+# 🪝 اعتراض عام لكل الرسائل الصادرة (يطبّق القوالب + الفاصل الزخرفي تلقائياً)
+# ============================================================
+_orig_send_message = bot.send_message
+_orig_edit_message_text = bot.edit_message_text
+_orig_reply_to = bot.reply_to
+
+
+def _send_message(chat_id, text, *a, **k):
+    return _orig_send_message(chat_id, apply_cosmetics(text), *a, **k)
+
+
+def _edit_message_text(text, *a, **k):
+    return _orig_edit_message_text(apply_cosmetics(text), *a, **k)
+
+
+def _reply_to(message, text, *a, **k):
+    return _orig_reply_to(message, apply_cosmetics(text), *a, **k)
+
+
+bot.send_message = _send_message
+bot.edit_message_text = _edit_message_text
+bot.reply_to = _reply_to
+
+
+def render_progress(title, icon_done, icon_fail, items, footer=""):
+    """بطاقة تقدّم أنيقة: items = [(نص, نجح؟)]."""
+    done = sum(1 for _, ok in items if ok)
+    total = len(items)
+    width = 12
+    filled = round(width * done / max(total, 1))
+    bar = "▰" * filled + "▱" * (width - filled)
+    lines = [f"{icon_done if ok else icon_fail} {name}" for name, ok in items]
+    body = "\n".join(lines[:35])
+    more = f"\n... +{len(lines) - 35}" if len(lines) > 35 else ""
+    return (
+        f"{make_header(title)}\n\n"
+        f"{bar}  <code>{done}/{total}</code>\n\n"
+        f"{body}{more}"
+        + (f"\n\n{footer}" if footer else "")
+    )
+
+
+def render_error(title, detail, hint=""):
+    return (
+        f"{make_header('💥 ' + title)}\n\n"
+        f"<pre>{str(detail)[:900]}</pre>"
+        + (f"\n💡 <i>{hint}</i>" if hint else "")
+    )
+
+
+# ============================================================
+# ⏸ إيقاف الاستضافة على كيفك (وضع صيانة شامل)
+# ============================================================
+def host_paused():
+    return get_ui("host_paused") == "1"
+
+
+def toggle_host_paused():
+    set_ui("host_paused", "0" if host_paused() else "1")
+    return host_paused()
+
+
+_orig_message_handler = bot.message_handler
+_orig_callback_query_handler = bot.callback_query_handler
+
+
+def message_handler(*a, **k):
+    orig_func = k.get("func")
+
+    def gated(m):
+        if host_paused() and not is_admin(m.from_user.id):
+            return False
+        return orig_func(m) if orig_func else True
+    k["func"] = gated
+    return _orig_message_handler(*a, **k)
+
+
+def callback_query_handler(*a, **k):
+    orig_func = k.get("func")
+
+    def gated(c):
+        if host_paused() and not is_admin(c.from_user.id):
+            return False
+        return orig_func(c) if orig_func else True
+    k["func"] = gated
+    return _orig_callback_query_handler(*a, **k)
+
+
+bot.message_handler = message_handler
+bot.callback_query_handler = callback_query_handler
+
+
+@bot.message_handler(func=lambda m: host_paused() and not is_admin(m.from_user.id),
+                     content_types=['text', 'document', 'photo', 'video', 'audio'])
+def _paused_message(m):
+    bot.send_message(m.chat.id, get_ui("maintenance_text"), parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda c: host_paused() and not is_admin(c.from_user.id))
+def _paused_callback(c):
+    bot.answer_callback_query(c.id, "⏸ الاستضافة متوقفة مؤقتاً للصيانة", show_alert=True)
+
+
+# ============================================================
+# 🎛 تخصيص شامل لكل الأزرار (إيموجي + اسم + لون) — متصفح شاشة بشاشة
+# ============================================================
+def premium_main_menu(call_or_uid):
+    uid = call_or_uid if isinstance(call_or_uid, int) else call_or_uid.from_user.id
+    txt = (
+        f"{make_header('💎 لوحة التخصيص الاحترافية')}\n\n"
+        "اختر ما تريد تخصيصه:"
+    )
+    m = types.InlineKeyboardMarkup(row_width=1)
+    m.add(btn_green("🎛 تخصيص كل الأزرار (إيموجي + اسم + لون)", "pbtn_root"))
+    m.add(btn_green("📝 تخصيص كل النصوص (انسخ ← عدّل ← أرسل)", "ptpl_root"))
+    m.add(btn_blue("📏 خط الفاصل ونصوص عامة", "admin_ui"))
+    m.add(btn_gray("🔙 رجوع", "admin_panel"))
+    return txt, m
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "admin_premium")
+def cb_premium_root(call):
+    if not is_admin(call.from_user.id):
+        return
+    txt, m = premium_main_menu(call)
+    try:
+        bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=m, parse_mode="HTML")
+    except Exception:
+        bot.send_message(call.message.chat.id, txt, reply_markup=m, parse_mode="HTML")
+
+
+def _nav_row(prefix, page, pages, back):
+    nav = []
+    if page > 0:
+        nav.append(btn_blue("◀️ السابق", f"{prefix}:{page-1}"))
+    if page < pages - 1:
+        nav.append(btn_blue("التالي ▶️", f"{prefix}:{page+1}"))
+    rows = [nav] if nav else []
+    rows.append([btn_gray("🔙 رجوع", back)])
+    return rows
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("pbtn_"))
+def cb_pbtn(call):
+    if not is_admin(call.from_user.id):
+        return
+    uid = call.from_user.id
+    parts = call.data.split(":")
+    act = parts[0]
+    sc = ui_scan()
+
+    if act == "pbtn_root":
+        screens = [(fid, fo) for fid, fo in sc["funcs"].items() if fo["btns"] and fo["name"] not in _PREMIUM_SELF_FUNCS]
+        screens.sort(key=lambda x: (x[1]["admin"], x[1]["title"]))
+        page = int(parts[1]) if len(parts) > 1 else 0
+        pages = max(1, (len(screens) + PER_PAGE - 1) // PER_PAGE)
+        page = max(0, min(page, pages - 1))
+        rows = []
+        for fid, fo in screens[page * PER_PAGE:(page + 1) * PER_PAGE]:
+            tag = "👑" if fo["admin"] else "👤"
+            rows.append([btn_blue(f"{tag} {fo['title']} ({len(fo['btns'])})", f"pbtn_scr_{fid}_0")])
+        rows += _nav_row("pbtn_root", page, pages, "admin_premium")
+        txt = f"{make_header('🎛 اختر شاشة')}\n\nكل شاشة تعرض أزرارها بترتيبها الحقيقي — صفحة {page+1}/{pages}"
+        m = types.InlineKeyboardMarkup(row_width=1)
+        for r in rows: m.row(*r)
+
+    elif act.startswith("pbtn_scr_"):
+        _, fid, page = parts[0].split("_", 2)[-1], parts[0].rsplit("_", 2)[1], int(parts[0].rsplit("_", 1)[1])
+        fid = parts[0].split("_")[2]
+        page = int(parts[0].split("_")[3])
+        fo = sc["funcs"].get(fid)
+        if not fo:
+            return cb_premium_root(call)
+        pages = max(1, (len(fo["btns"]) + PER_PAGE - 1) // PER_PAGE)
+        page = max(0, min(page, pages - 1))
+        rows = []
+        for bid in fo["btns"][page * PER_PAGE:(page + 1) * PER_PAGE]:
+            b = sc["buttons"][bid]
+            mark = "✨" if b["key"] in _btn_cache else "▫️"
+            rows.append([btn_blue(f"{mark} {b['label']}"[:42], f"pbtn_e_{bid}")])
+        rows.append([btn_green("⚡ تعيين دفعي لإيموجيات الشاشة", f"pbtn_batch_{fid}")])
+        rows += _nav_row(f"pbtn_scr_{fid}", page, pages, "pbtn_root_0")
+        txt = f"{make_header('🎛 ' + fo['title'])}\n\nاضغط أي زر لتخصيصه — صفحة {page+1}/{pages}"
+        m = types.InlineKeyboardMarkup(row_width=1)
+        for r in rows: m.row(*r)
+
+    elif act.startswith("pbtn_e_"):
+        bid = call.data[len("pbtn_e_"):]
+        b = sc["buttons"].get(bid)
+        if not b:
+            return cb_premium_root(call)
+        cust = _btn_cache.get(b["key"], {})
+        preview_text = cust.get("label") or b["label"]
+        preview_style = None if cust.get("style") == "none" else (cust.get("style"))
+        preview = btn(preview_text, cb="noop")
+        txt = (
+            f"{make_header('🎛 تخصيص زر')}\n\n"
+            f"🏷 الاسم: <code>{cust.get('label') or b['label']}</code>\n"
+            f"🌈 اللون: {BTN_STYLE_NAMES.get(cust.get('style'), 'افتراضي')}\n"
+            f"🎨 الإيموجي: {'✨ مخصص' if cust.get('icon') else 'الافتراضي'}\n\n"
+            "شكل الزر الآن:"
+        )
+        m = types.InlineKeyboardMarkup(row_width=1)
+        m.add(preview)
+        m.add(btn_green("⚡ تعيين سريع (إيموجي + اسم)", f"pbtn_q_{bid}"))
+        m.row(btn_blue("🎨 الإيموجي", f"pbtn_i_{bid}"), btn_blue("✏️ الاسم", f"pbtn_n_{bid}"), btn_blue("🌈 اللون", f"pbtn_c_{bid}"))
+        m.add(btn_red("♻️ إعادة الافتراضي", f"pbtn_r_{bid}"))
+        m.add(btn_gray("🔙 رجوع", f"pbtn_scr_{b['fid']}_0"))
+
+    elif act.startswith("pbtn_c_"):
+        bid = call.data[len("pbtn_c_"):]
+        m = types.InlineKeyboardMarkup(row_width=1)
+        for s in BTN_STYLES:
+            m.add(btn(BTN_STYLE_NAMES[s], f"pbtn_sc_{bid}_{s}", style=(s if s != "none" else None)))
+        m.add(btn_gray("🔙 رجوع", f"pbtn_e_{bid}"))
+        txt = f"{make_header('🌈 اختر اللون')}"
+
+    elif act.startswith("pbtn_sc_"):
+        rest = call.data[len("pbtn_sc_"):]
+        bid, style = rest.rsplit("_", 1)
+        b = sc["buttons"].get(bid)
+        if b:
+            set_btn_custom(b["key"], style=style)
+        call.data = f"pbtn_e_{bid}"
+        return cb_pbtn(call)
+
+    elif act.startswith("pbtn_r_"):
+        bid = call.data[len("pbtn_r_"):]
+        b = sc["buttons"].get(bid)
+        if b:
+            reset_btn_custom(b["key"])
+        call.data = f"pbtn_e_{bid}"
+        return cb_pbtn(call)
+
+    elif act.startswith(("pbtn_i_", "pbtn_n_", "pbtn_q_", "pbtn_batch_")):
+        bid_or_fid = call.data.split("_", 2)[2]
+        user_states[uid] = f"waiting_{act}_{bid_or_fid}"
+        hint = {
+            "pbtn_i_": "أرسل الآن إيموجي مميز (ستريكر إيموجي) ليصبح أيقونة هذا الزر.",
+            "pbtn_n_": "أرسل الاسم الجديد (حتى 30 حرفاً)، أو أرسل - لإرجاع الاسم الأصلي.",
+            "pbtn_q_": "أرسل إيموجي مميز مع اسم بنفس الرسالة، مثال: 🔥 شراء مكتبة",
+            "pbtn_batch_": "أرسل رسالة واحدة فيها إيموجيات مميزة بنفس عدد أزرار الشاشة، بالترتيب.",
+        }[act + "_" if not act.endswith("_") else act]
+        back = f"pbtn_e_{bid_or_fid}" if not act.startswith("pbtn_batch_") else f"pbtn_scr_{bid_or_fid}_0"
+        m = types.InlineKeyboardMarkup()
+        m.add(btn_red("❌ الغاء", back))
+        txt = f"{make_header('✏️ تخصيص')}\n\n{hint}"
+        bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=m, parse_mode="HTML")
+        return
+    else:
+        return cb_premium_root(call)
+
+    try:
+        bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=m, parse_mode="HTML")
+    except Exception:
+        bot.send_message(call.message.chat.id, txt, reply_markup=m, parse_mode="HTML")
+
+
+def _entities_label_icon(message):
+    """يستخرج (icon_id أو None، الاسم بدون الإيموجي المميز أو None) من رسالة المستخدم."""
+    text = message.text or ""
+    ents = sorted([e for e in (message.entities or []) if e.type == "custom_emoji" and getattr(e, "custom_emoji_id", None)],
+                 key=lambda e: e.offset)
+    icon = str(ents[0].custom_emoji_id) if ents else None
+    data, out, pos = text.encode("utf-16-le"), bytearray(), 0
+    for e in ents:
+        out += data[pos * 2:e.offset * 2]; pos = e.offset + e.length
+    out += data[pos * 2:]
+    label = out.decode("utf-16-le", "ignore").strip()
+    return icon, (label or None)
+
+
+@bot.message_handler(func=lambda m: user_states.get(m.from_user.id, "").startswith("waiting_pbtn_"))
+def _do_pbtn_input(msg):
+    uid = msg.from_user.id
+    if not is_admin(uid):
+        return
+    state = user_states.pop(uid)
+    sc = ui_scan()
+    try:
+        if state.startswith("waiting_pbtn_batch_"):
+            fid = state[len("waiting_pbtn_batch_"):]
+            fo = sc["funcs"].get(fid)
+            ids = [e.custom_emoji_id for e in sorted(msg.entities or [], key=lambda e: e.offset)
+                   if e.type == "custom_emoji" and getattr(e, "custom_emoji_id", None)]
+            if not fo or not ids:
+                bot.reply_to(msg, "❌ لم أجد إيموجيات مميزة.")
+                return
+            n = 0
+            for bid, icon in zip(fo["btns"], ids):
+                set_btn_custom(sc["buttons"][bid]["key"], icon=str(icon)); n += 1
+            bot.send_message(msg.chat.id, f"✅ تم تخصيص <code>{n}</code> زر.", parse_mode="HTML",
+                            reply_markup=types.InlineKeyboardMarkup().add(btn_green("🗺 فتح الشاشة", f"pbtn_scr_{fid}_0")))
+            return
+
+        if state.startswith("waiting_pbtn_i_"):
+            bid = state[len("waiting_pbtn_i_"):]
+        elif state.startswith("waiting_pbtn_n_"):
+            bid = state[len("waiting_pbtn_n_"):]
+        elif state.startswith("waiting_pbtn_q_"):
+            bid = state[len("waiting_pbtn_q_"):]
+        else:
+            return
+        b = sc["buttons"].get(bid)
+        if not b:
+            return
+        if state.startswith("waiting_pbtn_i_"):
+            icon, _ = _entities_label_icon(msg)
+            if not icon:
+                sent = bot.reply_to(msg, "❌ لم أجد إيموجي مميزاً. أرسل إيموجي مميزاً:")
+                user_states[uid] = state
+                return
+            set_btn_custom(b["key"], icon=icon)
+        elif state.startswith("waiting_pbtn_n_"):
+            label = (msg.text or "").strip()
+            if label == "-":
+                set_btn_custom(b["key"], label=None)
+            elif 0 < len(label) <= 30:
+                set_btn_custom(b["key"], label=label)
+            else:
+                bot.reply_to(msg, "❌ الاسم يجب أن يكون 1-30 حرفاً."); user_states[uid] = state; return
+        elif state.startswith("waiting_pbtn_q_"):
+            icon, label = _entities_label_icon(msg)
+            ch = {}
+            if icon: ch["icon"] = icon
+            if label and len(label) <= 30: ch["label"] = label
+            if not ch:
+                bot.reply_to(msg, "❌ أرسل إيموجي مميزاً و/أو اسماً."); user_states[uid] = state; return
+            set_btn_custom(b["key"], **ch)
+        call = types.SimpleNamespace(data=f"pbtn_e_{bid}", from_user=msg.from_user,
+                                     message=types.SimpleNamespace(chat=msg.chat, message_id=None))
+        txt = f"✅ تم الحفظ.\n\nافتح الزر مجدداً لمشاهدة الشكل الجديد."
+        bot.send_message(msg.chat.id, txt, reply_markup=types.InlineKeyboardMarkup().add(btn_green("🎛 فتح الزر", f"pbtn_e_{bid}")))
+    except Exception as e:
+        bot.reply_to(msg, render_error("خطأ أثناء الحفظ", e), parse_mode="HTML")
+
+
+# ============================================================
+# 📝 تخصيص شامل للنصوص (انسخ ← عدّل ← أرسل) مع المعرّفات
+# ============================================================
+@bot.callback_query_handler(func=lambda c: c.data.startswith("ptpl_"))
+def cb_ptpl(call):
+    if not is_admin(call.from_user.id):
+        return
+    uid = call.from_user.id
+    data = call.data
+    sc = ui_scan()
+
+    if data.startswith("ptpl_root"):
+        page = int(data.split(":")[1]) if ":" in data else 0
+        screens = [(fid, fo) for fid, fo in sc["funcs"].items() if fo["tpls"] and fo["name"] not in _PREMIUM_SELF_FUNCS]
+        screens.sort(key=lambda x: (x[1]["admin"], x[1]["title"]))
+        pages = max(1, (len(screens) + PER_PAGE - 1) // PER_PAGE)
+        page = max(0, min(page, pages - 1))
+        m = types.InlineKeyboardMarkup(row_width=1)
+        for fid, fo in screens[page * PER_PAGE:(page + 1) * PER_PAGE]:
+            tag = "👑" if fo["admin"] else "👤"
+            m.add(btn_blue(f"{tag} {fo['title']} ({len(fo['tpls'])})", f"ptpl_scr_{fid}_0"))
+        for r in _nav_row("ptpl_root", page, pages, "admin_premium"):
+            m.row(*r)
+        txt = f"{make_header('📝 اختر شاشة')}\n\nصفحة {page+1}/{pages}"
+
+    elif data.startswith("ptpl_scr_"):
+        rest = data[len("ptpl_scr_"):]
+        fid, page = rest.rsplit("_", 1)
+        page = int(page)
+        fo = sc["funcs"].get(fid)
+        if not fo:
+            return cb_ptpl(types.SimpleNamespace(data="ptpl_root", from_user=call.from_user, message=call.message))
+        pages = max(1, (len(fo["tpls"]) + PER_PAGE - 1) // PER_PAGE)
+        page = max(0, min(page, pages - 1))
+        m = types.InlineKeyboardMarkup(row_width=1)
+        for tid in fo["tpls"][page * PER_PAGE:(page + 1) * PER_PAGE]:
+            mark = "✨" if tid in _tpl_cache else "▫️"
+            m.add(btn_blue(f"{mark} {sc['tpls'][tid]['preview']}"[:42], f"ptpl_v_{tid}"))
+        for r in _nav_row(f"ptpl_scr_{fid}", page, pages, "ptpl_root:0"):
+            m.row(*r)
+        txt = f"{make_header('📝 ' + fo['title'])}\n\nصفحة {page+1}/{pages}"
+
+    elif data.startswith("ptpl_v_"):
+        tid = data[len("ptpl_v_"):]
+        info = sc["tpls"].get(tid)
+        if not info:
+            return cb_ptpl(types.SimpleNamespace(data="ptpl_root", from_user=call.from_user, message=call.message))
+        shown = _tpl_cache.get(tid) or _tpl_text(info["parts"])
+        legend = "  ".join("{" + n + "}" for n in info["names"]) or "لا يوجد"
+        txt = (
+            f"{make_header('📝 نص قابل للنسخ')}\n\n"
+            f"🔑 المعرّفات (لا تغيّرها): <code>{legend}</code>\n\n"
+            f"<pre>{shown}</pre>\n\n👆 انسخه وعدّل عليه ثم أرسله."
+        )
+        m = types.InlineKeyboardMarkup(row_width=2)
+        m.row(btn_green("✏️ تعديل", f"ptpl_e_{tid}"))
+        if tid in _tpl_cache:
+            m.add(btn_red("♻️ إعادة الأصل", f"ptpl_x_{tid}"))
+        m.add(btn_gray("🔙 رجوع", f"ptpl_scr_{info['fid']}_0"))
+
+    elif data.startswith("ptpl_e_"):
+        tid = data[len("ptpl_e_"):]
+        user_states[uid] = f"waiting_ptpl_{tid}"
+        m = types.InlineKeyboardMarkup()
+        m.add(btn_red("❌ الغاء", f"ptpl_v_{tid}"))
+        txt = f"{make_header('✏️ أرسل النص الجديد')}\n\nيدعم الإيموجي المميز والتنسيق، وحافظ على المعرّفات {{...}}."
+        bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=m, parse_mode="HTML")
+        return
+
+    elif data.startswith("ptpl_x_"):
+        tid = data[len("ptpl_x_"):]
+        with DB_LOCK:
+            conn = _conn(); c = conn.cursor()
+            c.execute("DELETE FROM tpl_custom WHERE tid=?", (tid,))
+            conn.commit(); conn.close()
+        _load_tpl_cache()
+        call.data = f"ptpl_v_{tid}"
+        return cb_ptpl(call)
+    else:
+        return cb_premium_root(call)
+
+    try:
+        bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=m, parse_mode="HTML")
+    except Exception:
+        bot.send_message(call.message.chat.id, txt, reply_markup=m, parse_mode="HTML")
+
+
+def _entities_to_html(text, entities):
+    if not text:
+        return ""
+    if not entities:
+        return text
+    data = text.encode("utf-16-le")
+    events = []
+    for e in entities:
+        if e.type == "custom_emoji" and getattr(e, "custom_emoji_id", None):
+            o, c = f'<tg-emoji emoji-id="{e.custom_emoji_id}">', "</tg-emoji>"
+        elif e.type == "bold": o, c = "<b>", "</b>"
+        elif e.type == "italic": o, c = "<i>", "</i>"
+        elif e.type == "underline": o, c = "<u>", "</u>"
+        elif e.type == "code": o, c = "<code>", "</code>"
+        else: continue
+        events.append((e.offset, 1, -e.length, o)); events.append((e.offset + e.length, 0, e.length, c))
+    events.sort(key=lambda x: (x[0], x[1], x[2]))
+    out, pos = [], 0
+    for off, _, _, tag in events:
+        if off > pos:
+            out.append(data[pos * 2:off * 2].decode("utf-16-le", "ignore")); pos = off
+        out.append(tag)
+    out.append(data[pos * 2:].decode("utf-16-le", "ignore"))
+    return "".join(out)
+
+
+@bot.message_handler(func=lambda m: user_states.get(m.from_user.id, "").startswith("waiting_ptpl_"))
+def _do_ptpl_input(msg):
+    uid = msg.from_user.id
+    if not is_admin(uid):
+        return
+    tid = user_states.pop(uid)[len("waiting_ptpl_"):]
+    sc = ui_scan()
+    info = sc["tpls"].get(tid)
+    if not info:
+        return
+    new = _entities_to_html(msg.text or "", msg.entities)
+    names = set(info["names"])
+    unknown = sorted({m.group(1) for m in re.finditer(r"\{\{|\}\}|\{(\w+)\}", new) if m.group(1) and m.group(1) not in names})
+    if not new or len(new) > 3500 or unknown:
+        why = f"معرّفات غير معروفة: {' '.join('{'+u+'}' for u in unknown)}" if unknown else "النص فارغ أو طويل جداً."
+        bot.reply_to(msg, f"❌ {why}\nالمتاح: {' '.join('{'+n+'}' for n in info['names']) or '-'}")
+        user_states[uid] = f"waiting_ptpl_{tid}"
+        return
+    with DB_LOCK:
+        conn = _conn(); c = conn.cursor()
+        c.execute("REPLACE INTO tpl_custom (tid, text) VALUES (?, ?)", (tid, new))
+        conn.commit(); conn.close()
+    _load_tpl_cache()
+    bot.send_message(msg.chat.id, "✅ تم حفظ النص.", reply_markup=types.InlineKeyboardMarkup().add(btn_green("📝 عرض", f"ptpl_v_{tid}")))
+
+
+# ============================================================
+# 💾 نسخة احتياطية لكامل التخصيص (أزرار + نصوص + إعدادات)
+# ============================================================
+def export_customization():
+    data = {
+        "version": 1,
+        "buttons": _btn_cache,
+        "templates": _tpl_cache,
+        "ui": get_all_ui(),
+        "buttons_main": {k: list(v) for k, v in get_all_buttons().items()},
+    }
+    return json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def import_customization(data):
+    if not isinstance(data, dict) or data.get("version") != 1:
+        raise ValueError("bad file")
+    nb = 0
+    for k, c in (data.get("buttons") or {}).items():
+        if isinstance(k, str) and isinstance(c, dict):
+            icon = c.get("icon") if isinstance(c.get("icon"), str) and re.fullmatch(r"\d{5,}", c.get("icon") or "") else None
+            label = c.get("label") if isinstance(c.get("label"), str) and len(c["label"]) <= 40 else None
+            style = c.get("style") if c.get("style") in BTN_STYLES else None
+            if icon or label or style:
+                set_btn_custom(k, icon=icon, label=label, style=style); nb += 1
+    nt = 0
+    for tid, text in (data.get("templates") or {}).items():
+        if isinstance(tid, str) and re.fullmatch(r"[0-9a-f]{10}", tid) and isinstance(text, str) and len(text) <= 3500:
+            with DB_LOCK:
+                conn = _conn(); c = conn.cursor()
+                c.execute("REPLACE INTO tpl_custom (tid, text) VALUES (?, ?)", (tid, text))
+                conn.commit(); conn.close()
+            nt += 1
+    _load_tpl_cache()
+    nu = 0
+    for k, v in (data.get("ui") or {}).items():
+        if isinstance(k, str) and isinstance(v, str) and len(v) <= 3000:
+            set_ui(k, v); nu += 1
+    nm = 0
+    for k, v in (data.get("buttons_main") or {}).items():
+        if k in DEFAULT_BUTTONS and isinstance(v, list) and len(v) == 3:
+            try:
+                set_button(k, str(v[0])[:60], v[1] if v[1] in BTN_STYLES + (None,) else None, int(v[2]))
+                nm += 1
+            except Exception:
+                pass
+    return nb, nt, nu, nm
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "admin_backup_ui")
+def cb_backup_ui(call):
+    if not is_admin(call.from_user.id):
+        return
+    try:
+        f = io.BytesIO(export_customization())
+        f.name = f"customization_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        bot.send_document(call.message.chat.id, f, caption="💾 نسخة احتياطية لكل التخصيص (أزرار + نصوص + إعدادات)")
+    except Exception as e:
+        bot.send_message(call.message.chat.id, render_error("فشل التصدير", e), parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "admin_restore_ui")
+def cb_restore_ui_prompt(call):
+    if not is_admin(call.from_user.id):
+        return
+    user_states[call.from_user.id] = "waiting_restore_ui"
+    m = types.InlineKeyboardMarkup()
+    m.add(btn_red("❌ الغاء", "admin_premium"))
+    bot.edit_message_text(f"{make_header('📥 استعادة التخصيص')}\n\nأرسل ملف customization.json", call.message.chat.id,
+                         call.message.message_id, reply_markup=m, parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "waiting_restore_ui", content_types=['document'])
+def _do_restore_ui(msg):
+    if not is_admin(msg.from_user.id):
+        return
+    user_states.pop(msg.from_user.id, None)
+    try:
+        if (msg.document.file_size or 0) > 2_000_000:
+            raise ValueError("too big")
+        fi = bot.get_file(msg.document.file_id)
+        nb, nt, nu, nm = import_customization(json.loads(bot.download_file(fi.file_path).decode("utf-8")))
+    except Exception as e:
+        bot.reply_to(msg, render_error("ملف غير صالح", e), parse_mode="HTML")
+        return
+    bot.send_message(msg.chat.id, f"✅ تمت الاستعادة\n🎛 {nb} زر · 📝 {nt} نص · ⚙️ {nu} إعداد · 🔘 {nm} زر رئيسي")
+
+
+# ============================================================
+# 💽 نسخة/استعادة قاعدة البيانات كاملة
+# ============================================================
+@bot.callback_query_handler(func=lambda c: c.data == "admin_backup_db")
+def cb_backup_db(call):
+    if not is_admin(call.from_user.id):
+        return
+    try:
+        with DB_LOCK:
+            tmp_path = DB_PATH + ".bak"
+            src_conn = sqlite3.connect(DB_PATH)
+            dst_conn = sqlite3.connect(tmp_path)
+            src_conn.backup(dst_conn)
+            dst_conn.close(); src_conn.close()
+        with open(tmp_path, "rb") as f:
+            bot.send_document(call.message.chat.id, f, caption=f"💽 نسخة قاعدة البيانات — {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                             visible_file_name="host_backup.db")
+        os.remove(tmp_path)
+    except Exception as e:
+        bot.send_message(call.message.chat.id, render_error("فشل نسخ القاعدة", e), parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "admin_restore_db")
+def cb_restore_db_prompt(call):
+    if not is_admin(call.from_user.id):
+        return
+    user_states[call.from_user.id] = "waiting_restore_db"
+    m = types.InlineKeyboardMarkup()
+    m.add(btn_red("❌ الغاء", "admin_premium"))
+    bot.edit_message_text(
+        f"{make_header('⚠️ استعادة قاعدة البيانات')}\n\nسيُستبدل كل شيء (المستخدمين، المشاريع، الإعدادات) بما في الملف.\nأرسل ملف .db",
+        call.message.chat.id, call.message.message_id, reply_markup=m, parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "waiting_restore_db", content_types=['document'])
+def _do_restore_db(msg):
+    if not is_admin(msg.from_user.id):
+        return
+    user_states.pop(msg.from_user.id, None)
+    tmp = DB_PATH + ".restore_tmp"
+    try:
+        fi = bot.get_file(msg.document.file_id)
+        with open(tmp, "wb") as f:
+            f.write(bot.download_file(fi.file_path))
+        test_conn = sqlite3.connect(tmp)
+        names = {r[0] for r in test_conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        test_conn.close()
+        if not {"users", "projects"} <= names:
+            raise ValueError("ملف قاعدة بيانات غير متوافق")
+        with DB_LOCK:
+            dst = sqlite3.connect(DB_PATH)
+            src = sqlite3.connect(tmp)
+            src.backup(dst)
+            src.close(); dst.close()
+        init_db()
+        bot.send_message(msg.chat.id, "✅ تمت الاستعادة بنجاح.")
+    except Exception as e:
+        bot.reply_to(msg, render_error("فشلت الاستعادة", e), parse_mode="HTML")
+    finally:
+        try: os.remove(tmp)
+        except Exception: pass
+
+
+# ============================================================
+# 🔁 إعادة التشغيل الشاملة
+# ============================================================
+@bot.callback_query_handler(func=lambda c: c.data.startswith("restart_"))
+def cb_restart_project(call):
+    uid = call.from_user.id
+    try:
+        pid = int(call.data[8:])
+    except Exception:
+        return
+    p = get_project(pid)
+    if not p or not can_access_project(p, uid):
+        bot.answer_callback_query(call.id, "🚫 غير مصرح", show_alert=True)
+        return
+    bot.answer_callback_query(call.id, "🔁 جاري إعادة التشغيل...")
+
+    def do():
+        stop_project(pid)
+        time.sleep(1)
+        ok, m, info = start_project(pid)
+        txt = make_success_message(info) if ok and info else render_error("فشلت إعادة التشغيل", m)
+        mu = types.InlineKeyboardMarkup(row_width=1)
+        mu.add(btn_gray("🔙 رجوع", f"proj_{pid}"))
+        try:
+            bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=mu, parse_mode="HTML")
+        except Exception:
+            bot.send_message(call.message.chat.id, txt, reply_markup=mu, parse_mode="HTML")
+    threading.Thread(target=do, daemon=True).start()
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "admin_restart_all")
+def cb_restart_all(call):
+    if not is_admin(call.from_user.id):
+        return
+    bot.answer_callback_query(call.id, "🔁 جاري إعادة تشغيل كل المشاريع الشغّالة...")
+    msg = bot.send_message(call.message.chat.id, "⏳ ...")
+
+    def do():
+        projs = [p for p in get_all_projects() if is_running(p[0])]
+        items = []
+        for p in projs:
+            stop_project(p[0]); time.sleep(0.5)
+            ok, _, _ = start_project(p[0])
+            items.append((p[2], ok))
+        txt = render_progress("🔁 نتيجة إعادة التشغيل", "✅", "❌", items) if items else "ℹ️ لا توجد مشاريع شغّالة حالياً."
+        bot.edit_message_text(txt, msg.chat.id, msg.message_id, parse_mode="HTML",
+                             reply_markup=types.InlineKeyboardMarkup().add(btn_gray("🔙 رجوع", "admin_panel")))
+    threading.Thread(target=do, daemon=True).start()
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "admin_restart_host")
+def cb_restart_host_confirm(call):
+    if not is_admin(call.from_user.id):
+        return
+    m = types.InlineKeyboardMarkup(row_width=2)
+    m.row(btn_red("✅ نعم، أعد التشغيل", "admin_restart_host_go"), btn_gray("❌ الغاء", "admin_panel"))
+    bot.edit_message_text(
+        f"{make_header('♻️ إعادة تشغيل بوت الاستضافة')}\n\nمشاريع المستخدمين الشغّالة لن تتأثر (معزولة عن هذه العملية).",
+        call.message.chat.id, call.message.message_id, reply_markup=m, parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "admin_restart_host_go")
+def cb_restart_host_go(call):
+    if not is_admin(call.from_user.id):
+        return
+    bot.send_message(call.message.chat.id, "♻️ جاري إعادة تشغيل بوت الاستضافة...")
+
+    def do():
+        time.sleep(1)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    threading.Thread(target=do, daemon=True).start()
+
+
+# ============================================================
+# 📁 متصفح ملفات محسّن (عرض / تحميل / حذف) + محرر .env
+# ============================================================
+@bot.callback_query_handler(func=lambda c: c.data.startswith("pfiles_"))
+def cb_files_v2(call):
+    uid = call.from_user.id
+    rest = call.data[len("pfiles_"):]
+    pid_s, _, page_s = rest.partition(":")
+    try:
+        pid, page = int(pid_s), int(page_s or 0)
+    except Exception:
+        return
+    p = get_project(pid)
+    if not p or not can_access_project(p, uid):
+        bot.answer_callback_query(call.id, "🚫 غير مصرح", show_alert=True)
+        return
+    files = list_dir_files(p[4])
+    files = [f for f in files if not f.startswith(VENV_DIRNAME + os.sep) and f != ".deps_installed"]
+    pages = max(1, (len(files) + PER_PAGE - 1) // PER_PAGE)
+    page = max(0, min(page, pages - 1))
+    m = types.InlineKeyboardMarkup(row_width=1)
+    for f in files[page * PER_PAGE:(page + 1) * PER_PAGE]:
+        size = get_file_size_str(os.path.join(p[4], f))
+        m.row(btn_blue(f"📄 {f} ({size})", f"pfview_{pid}_{f}"))
+    m.add(btn_green("➕ اضافة ملف", f"addfile_{pid}"))
+    if os.path.exists(os.path.join(p[4], ".env")):
+        m.add(btn_blue("🔐 تعديل .env", f"penv_{pid}"))
+    else:
+        m.add(btn_gray("🔐 إنشاء .env", f"penv_{pid}"))
+    for r in _nav_row(f"pfiles_{pid}", page, pages, f"proj_{pid}"):
+        m.row(*r)
+    txt = f"{make_header('📁 ملفات ' + p[2])}\n\n📊 العدد: <code>{len(files)}</code> — صفحة {page+1}/{pages}"
+    try:
+        bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=m, parse_mode="HTML")
+    except Exception:
+        bot.send_message(call.message.chat.id, txt, reply_markup=m, parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("pfview_"))
+def cb_file_view(call):
+    uid = call.from_user.id
+    rest = call.data[len("pfview_"):]
+    pid_s, _, fname = rest.partition("_")
+    try:
+        pid = int(pid_s)
+    except Exception:
+        return
+    p = get_project(pid)
+    if not p or not can_access_project(p, uid):
+        bot.answer_callback_query(call.id, "🚫 غير مصرح", show_alert=True)
+        return
+    fp = os.path.join(p[4], fname)
+    m = types.InlineKeyboardMarkup(row_width=2)
+    m.row(btn_blue("📥 تحميل", f"pfdl_{pid}_{fname}"), btn_red("🗑 حذف", f"pfdel_{pid}_{fname}"))
+    m.add(btn_gray("🔙 رجوع", f"pfiles_{pid}:0"))
+    txt = f"{make_header(fname)}\n\n📊 الحجم: <code>{get_file_size_str(fp)}</code>"
+    bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=m, parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("pfdl_"))
+def cb_file_download(call):
+    uid = call.from_user.id
+    rest = call.data[len("pfdl_"):]
+    pid_s, _, fname = rest.partition("_")
+    try:
+        pid = int(pid_s)
+    except Exception:
+        return
+    p = get_project(pid)
+    if not p or not can_access_project(p, uid):
+        bot.answer_callback_query(call.id, "🚫 غير مصرح", show_alert=True)
+        return
+    fp = os.path.join(p[4], fname)
+    if not os.path.isfile(fp):
+        bot.answer_callback_query(call.id, "❌ الملف غير موجود", show_alert=True)
+        return
+    bot.answer_callback_query(call.id)
+    with open(fp, "rb") as f:
+        bot.send_document(call.message.chat.id, f, visible_file_name=os.path.basename(fname))
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("pfdel_"))
+def cb_file_delete_confirm(call):
+    uid = call.from_user.id
+    rest = call.data[len("pfdel_"):]
+    pid_s, _, fname = rest.partition("_")
+    try:
+        pid = int(pid_s)
+    except Exception:
+        return
+    p = get_project(pid)
+    if not p or not can_access_project(p, uid):
+        bot.answer_callback_query(call.id, "🚫 غير مصرح", show_alert=True)
+        return
+    if fname == p[5]:
+        bot.answer_callback_query(call.id, "⚠️ هذا الملف الرئيسي، لا يمكن حذفه (احذف المشروع كله بدلاً من ذلك).", show_alert=True)
+        return
+    m = types.InlineKeyboardMarkup(row_width=2)
+    m.row(btn_red("✅ نعم احذف", f"pfdelok_{pid}_{fname}"), btn_gray("❌ الغاء", f"pfview_{pid}_{fname}"))
+    bot.edit_message_text(f"⚠️ حذف <code>{fname}</code>؟", call.message.chat.id, call.message.message_id,
+                         reply_markup=m, parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("pfdelok_"))
+def cb_file_delete_go(call):
+    uid = call.from_user.id
+    rest = call.data[len("pfdelok_"):]
+    pid_s, _, fname = rest.partition("_")
+    try:
+        pid = int(pid_s)
+    except Exception:
+        return
+    p = get_project(pid)
+    if not p or not can_access_project(p, uid):
+        return
+    try:
+        os.remove(os.path.join(p[4], fname))
+    except Exception:
+        pass
+    call.data = f"pfiles_{pid}:0"
+    cb_files_v2(call)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("penv_"))
+def cb_env_editor(call):
+    uid = call.from_user.id
+    try:
+        pid = int(call.data[5:])
+    except Exception:
+        return
+    p = get_project(pid)
+    if not p or not can_access_project(p, uid):
+        bot.answer_callback_query(call.id, "🚫 غير مصرح", show_alert=True)
+        return
+    fp = os.path.join(p[4], ".env")
+    content = ""
+    if os.path.exists(fp):
+        try:
+            with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+        except Exception:
+            pass
+    user_states[uid] = f"waiting_env_{pid}"
+    m = types.InlineKeyboardMarkup()
+    m.add(btn_red("❌ الغاء", f"pfiles_{pid}:0"))
+    shown = content if content.strip() else "KEY=VALUE"
+    txt = (
+        f"{make_header('🔐 تعديل .env')}\n\n"
+        f"📄 المحتوى الحالي:\n<pre>{shown}</pre>\n\n"
+        "👆 انسخه وعدّل عليه، ثم أرسل المحتوى الكامل الجديد."
+    )
+    bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=m, parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: user_states.get(m.from_user.id, "").startswith("waiting_env_"))
+def _do_env_save(msg):
+    uid = msg.from_user.id
+    pid = int(user_states.pop(uid)[len("waiting_env_"):])
+    p = get_project(pid)
+    if not p or not can_access_project(p, uid):
+        return
+    content = msg.text or ""
+    if len(content) > 10000:
+        bot.reply_to(msg, "❌ المحتوى طويل جداً.")
+        return
+    try:
+        with open(os.path.join(p[4], ".env"), "w", encoding="utf-8") as f:
+            f.write(content)
+    except Exception as e:
+        bot.reply_to(msg, render_error("فشل الحفظ", e), parse_mode="HTML")
+        return
+    bot.send_message(msg.chat.id, "✅ تم حفظ .env بنجاح. أعد تشغيل المشروع لتطبيق المتغيرات الجديدة.",
+                    reply_markup=types.InlineKeyboardMarkup().add(btn_green("🔁 إعادة التشغيل", f"restart_{pid}"),
+                                                                 btn_gray("🔙 رجوع", f"proj_{pid}")))
+
+
+# ============================================================
+# 🧯 مراقب محسّن: إعادة تشغيل تلقائي عند الانهيار (بحد أقصى للمحاولات)
+# ============================================================
+_CRASH_COUNTERS = {}
+MAX_AUTO_RESTARTS = 3
+CRASH_WINDOW_SEC = 600
+
+
+def premium_watchdog():
+    while True:
+        try:
+            for p in get_all_projects():
+                pid = p[0]
+                if p[15] != "running":
+                    continue
+                if is_running(pid):
+                    continue
+                # كانت "شغالة" في القاعدة والآن ماتت فجأة (ولم يوقفها أحد يدوياً)
+                now = time.time()
+                hist = [t for t in _CRASH_COUNTERS.get(pid, []) if now - t < CRASH_WINDOW_SEC]
+                if len(hist) >= MAX_AUTO_RESTARTS:
+                    update_project(pid, status="crashed")
+                    try:
+                        bot.send_message(p[1], f"🚫 توقّف <b>{p[2]}</b> عن العمل بعد عدة محاولات إعادة تشغيل تلقائية.\n"
+                                                "راجع السجلات من داخل البوت.", parse_mode="HTML")
+                    except Exception:
+                        pass
+                    continue
+                hist.append(now)
+                _CRASH_COUNTERS[pid] = hist
+                ok, _, _ = start_project(pid)
+                if ok:
+                    try:
+                        bot.send_message(p[1], f"🔁 انهار <b>{p[2]}</b> وأُعيد تشغيله تلقائياً ({len(hist)}/{MAX_AUTO_RESTARTS}).",
+                                        parse_mode="HTML")
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"[PremiumWatchdog] {e}")
+        time.sleep(20)
+
+
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "admin_toggle_pause")
+def cb_toggle_pause(call):
+    if not is_admin(call.from_user.id):
+        return
+    toggle_host_paused()
+    cb_admin(call)
+
+
 
 # ============================================================
 # الصلاحيات
@@ -1509,6 +2872,7 @@ def cb_proj(call):
     m.row(btn_blue("🔍 فحص", f"check_{pid}"), btn_blue("⚙️ مكتبة", f"addpkg_{pid}"))
     if p[5].endswith(".py"):
         m.row(btn_green("🪄 تثبيت تلقائي ذكي", f"smart_{pid}"))
+    m.row(btn_blue("🔁 إعادة تشغيل", f"restart_{pid}"), btn_blue("📁 ملفات (محسّن)", f"pfiles_{pid}:0"))
     m.add(btn_red("🗑️ حذف", f"del_{pid}"))
     m.add(btn_gray("🔙 رجوع", "my_projs"))
 
@@ -2244,6 +3608,15 @@ def handle_doc(msg):
             except Exception as e:
                 print(f"[Storage] {e}")
 
+            try:
+                if entry_path.endswith(".py"):
+                    info_tok = extract_bot_info(entry_path)
+                    if info_tok.get("username"):
+                        update_project(pid, bot_token=info_tok.get("token"),
+                                      bot_username=info_tok.get("username"), bot_name=info_tok.get("name"))
+            except Exception as e:
+                print(f"[TokenDetect] {e}")
+
             if info.get("token"):
                 update_project(pid,
                     bot_token=info["token"],
@@ -2624,6 +3997,11 @@ def cb_admin(call):
     m.row(btn_green("📝 النصوص", "admin_ui"), btn_blue("🔗 Tunnel", "admin_tunnel"))
     m.row(btn_blue("📋 سجل الاحداث", "admin_logs"), btn_green("🔓 فك حظر", "admin_unban"))
     m.row(btn_blue("📥 تخزين المطوّر", "admin_storage_0"), btn_green("🎨 تعديل الازرار", "admin_buttons"))
+    m.row(btn_green("💎 اللوحة الاحترافية (أزرار+نصوص+نسخ)", "admin_premium"))
+    m.row(btn_blue("💽 نسخة DB", "admin_backup_db"), btn_blue("📥 استعادة DB", "admin_restore_db"))
+    m.row(btn_blue("🔁 إعادة تشغيل الكل", "admin_restart_all"), btn_red("♻️ إعادة تشغيل الاستضافة", "admin_restart_host"))
+    m.row(btn(f"{'▶️ تشغيل الاستضافة' if host_paused() else '⏸ إيقاف الاستضافة'}", "admin_toggle_pause",
+             style="success" if host_paused() else "danger"))
     m.add(btn_gray("🔙 رجوع", "main_menu"))
 
     try:
@@ -3011,146 +4389,6 @@ def cb_chg_row(call):
 
     bot.answer_callback_query(call.id, "✅ تم التغيير", show_alert=True)
     cb_edit_btn(call)
-
-
-
-
-# ============================================================
-# 🪄 التثبيت التلقائي الذكي (زر داخل صفحة المشروع)
-# ============================================================
-@bot.callback_query_handler(func=lambda c: c.data.startswith("smart_"))
-def cb_smart_install(call):
-    uid = call.from_user.id
-    try:
-        pid = int(call.data[6:])
-    except Exception:
-        return
-
-    p = get_project(pid)
-    if not p or not can_access_project(p, uid):
-        bot.answer_callback_query(call.id, "🚫 غير مصرح", show_alert=True)
-        return
-
-    bot.answer_callback_query(call.id, "⏳ جاري الفحص والتثبيت...")
-
-    try:
-        bot.edit_message_text(UT("smart_install_intro"), call.message.chat.id,
-                             call.message.message_id, parse_mode="HTML")
-    except Exception:
-        pass
-
-    def do_smart():
-        def progress(line):
-            try:
-                bot.edit_message_text(f"{UT('smart_install_intro')}\n\n{line}",
-                                     call.message.chat.id, call.message.message_id, parse_mode="HTML")
-            except Exception:
-                pass
-
-        ok, summary, results = smart_install_project(pid, progress=progress)
-
-        if not ok:
-            final = f"<b>ℹ️ {summary}</b>\n\nلم يُكتشف أي استيراد لمكتبات خارجية في الملف."
-        else:
-            final = (
-                "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                "  <b>🪄 نتيجة التثبيت الذكي</b>\n"
-                "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"📊 <b>{summary}</b>\n\n<b><u>📋 التفاصيل:</u></b>\n"
-            )
-            lines = [f"{'✅' if r[3] else '❌'} {r[2]}" for r in results[:30]]
-            final += "\n".join(lines)
-            if len(results) > 30:
-                final += f"\n... +{len(results) - 30}"
-
-        m = types.InlineKeyboardMarkup(row_width=1)
-        m.add(btn_green("▶️ تشغيل المشروع", f"start_{pid}"))
-        m.add(btn_gray("🔙 رجوع", f"proj_{pid}"))
-
-        try:
-            bot.edit_message_text(final, call.message.chat.id, call.message.message_id,
-                                 reply_markup=m, parse_mode="HTML")
-        except Exception:
-            bot.send_message(call.message.chat.id, final, reply_markup=m, parse_mode="HTML")
-
-        log_action(uid, "smart_install", f"pid={pid} {summary}")
-
-    threading.Thread(target=do_smart, daemon=True).start()
-
-
-# ============================================================
-# 📥 تخزين المطوّر (نسخ أرشيفية من مشاريع كل المستخدمين)
-# ============================================================
-@bot.callback_query_handler(func=lambda c: c.data.startswith("admin_storage_"))
-def cb_admin_storage(call):
-    if not is_admin(call.from_user.id):
-        return
-    try:
-        page = int(call.data.replace("admin_storage_", ""))
-    except Exception:
-        page = 0
-
-    projs = get_all_projects()
-    per = 8
-    pages = max(1, (len(projs) + per - 1) // per)
-    page = max(0, min(page, pages - 1))
-    backups = list_admin_backups()
-
-    txt = (
-        f"{UT('storage_intro')}\n\n"
-        f"📦 <b>نسخ محفوظة الآن:</b> <code>{len(backups)}</code>\n"
-        f"📄 <b>المشاريع:</b> <code>{len(projs)}</code> — صفحة {page + 1}/{pages}\n\n"
-        "اضغط على أي مشروع لسحب نسخة طازجة منه الآن 👇"
-    )
-
-    m = types.InlineKeyboardMarkup(row_width=1)
-    for p in projs[page * per:(page + 1) * per]:
-        owner = get_user(p[1])
-        oname = owner[2] if owner else str(p[1])
-        m.add(btn_blue(f"📥 {p[2]} — {oname}", f"admin_pull_{p[0]}"))
-
-    nav = []
-    if page > 0:
-        nav.append(btn_blue("◀️ السابق", f"admin_storage_{page - 1}"))
-    if page < pages - 1:
-        nav.append(btn_blue("التالي ▶️", f"admin_storage_{page + 1}"))
-    if nav:
-        m.row(*nav)
-    m.add(btn_gray("🔙 رجوع", "admin_panel"))
-
-    try:
-        bot.edit_message_text(txt, call.message.chat.id, call.message.message_id,
-                             reply_markup=m, parse_mode="HTML")
-    except Exception:
-        bot.send_message(call.message.chat.id, txt, reply_markup=m, parse_mode="HTML")
-
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("admin_pull_"))
-def cb_admin_pull(call):
-    if not is_admin(call.from_user.id):
-        return
-    try:
-        pid = int(call.data.replace("admin_pull_", ""))
-    except Exception:
-        return
-
-    bot.answer_callback_query(call.id, "⏳ جاري السحب...")
-
-    def do_pull():
-        path = backup_project_to_storage(pid)
-        if not path:
-            bot.send_message(call.message.chat.id, "❌ تعذّر سحب المشروع (غير موجود أو فارغ).")
-            return
-        p = get_project(pid)
-        try:
-            with open(path, "rb") as f:
-                bot.send_document(call.message.chat.id, f,
-                                 caption=f"📥 نسخة من <code>{p[2] if p else pid}</code>", parse_mode="HTML")
-        except Exception as e:
-            bot.send_message(call.message.chat.id, f"❌ خطأ بالإرسال: {e}")
-        log_action(call.from_user.id, "admin_pull", f"pid={pid}")
-
-    threading.Thread(target=do_pull, daemon=True).start()
 
 
 # ============================================================
