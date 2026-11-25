@@ -45,8 +45,8 @@ ensure_packages()
 # ============================================================
 # الإعدادات
 # ============================================================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8666557982:AAEAGck0Zs12349kw-Q_adqk2aDigSc_Oog")
-ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "7602226699").split(",")]
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "9062665659:AAE2ubEi1CWrrsRM83Pp0XyKMlqlelpTCvQ")
+ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "7325566792").split(",")]
 DEVELOPER_USERNAME = "E_E_72"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
