@@ -45,8 +45,8 @@ ensure_packages()
 # ============================================================
 # الإعدادات
 # ============================================================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "9062665659:AAE2ubEi1CWrrsRM83Pp0XyKMlqlelpTCvQ")
-ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "7325566792").split(",")]
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8666557982:AAEAGck0Zs12349kw-Q_adqk2aDigSc_Oog")
+ADMIN_IDS = [int(x) for x in os.environ.get("ADMIN_IDS", "7602226699").split(",")]
 DEVELOPER_USERNAME = "E_E_72"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -108,7 +108,15 @@ def init_db():
             port INTEGER DEFAULT 0, public_url TEXT DEFAULT '', installed INTEGER DEFAULT 0,
             pid INTEGER DEFAULT 0, status TEXT DEFAULT 'stopped', created_at TEXT,
             last_start TEXT DEFAULT '', last_stop TEXT DEFAULT '',
+            approved INTEGER DEFAULT 0,
             FOREIGN KEY (owner_id) REFERENCES users(user_id) ON DELETE CASCADE)''')
+        try:
+            c.execute("ALTER TABLE projects ADD COLUMN approved INTEGER DEFAULT 1")
+        except sqlite3.OperationalError:
+            pass
+        c.execute('''CREATE TABLE IF NOT EXISTS trusted_users (
+            user_id INTEGER PRIMARY KEY, username TEXT DEFAULT '',
+            first_name TEXT DEFAULT '', added_by INTEGER DEFAULT 0, created_at TEXT)''')
         c.execute('''CREATE TABLE IF NOT EXISTS ui_settings (key TEXT PRIMARY KEY, value TEXT)''')
         c.execute('''CREATE TABLE IF NOT EXISTS action_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, action TEXT,
@@ -350,6 +358,121 @@ def count_user_projects(uid):
         conn = _conn(); c = conn.cursor()
         c.execute("SELECT COUNT(*) FROM projects WHERE owner_id=?", (uid,))
         r = c.fetchone()[0]; conn.close(); return r
+
+
+def is_trusted_user(uid):
+    if is_admin(uid):
+        return True
+    with DB_LOCK:
+        conn = _conn(); c = conn.cursor()
+        c.execute("SELECT 1 FROM trusted_users WHERE user_id=?", (uid,))
+        r = c.fetchone(); conn.close()
+        return bool(r)
+
+
+def add_trusted_user(uid, username="", first_name="", added_by=0):
+    with DB_LOCK:
+        conn = _conn(); c = conn.cursor()
+        c.execute(
+            "REPLACE INTO trusted_users (user_id, username, first_name, added_by, created_at) VALUES (?, ?, ?, ?, ?)",
+            (int(uid), username or "", first_name or "", int(added_by), datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        )
+        conn.commit(); conn.close()
+
+
+def remove_trusted_user(uid):
+    with DB_LOCK:
+        conn = _conn(); c = conn.cursor()
+        c.execute("DELETE FROM trusted_users WHERE user_id=?", (int(uid),))
+        changed = c.rowcount
+        conn.commit(); conn.close()
+        return changed > 0
+
+
+def get_all_trusted_users():
+    with DB_LOCK:
+        conn = _conn(); c = conn.cursor()
+        c.execute("SELECT user_id, username, first_name, added_by, created_at FROM trusted_users ORDER BY created_at DESC")
+        r = c.fetchall(); conn.close(); return r
+
+
+def find_user_by_username(uname):
+    uname = (uname or "").strip().lstrip("@").lower()
+    if not uname:
+        return None
+    with DB_LOCK:
+        conn = _conn(); c = conn.cursor()
+        c.execute("SELECT user_id, username, first_name FROM users WHERE LOWER(username)=?", (uname,))
+        r = c.fetchone(); conn.close(); return r
+
+
+def get_project_approved(pid):
+    with DB_LOCK:
+        conn = _conn(); c = conn.cursor()
+        c.execute("SELECT COALESCE(approved, 1) FROM projects WHERE id=?", (pid,))
+        r = c.fetchone(); conn.close()
+        return int(r[0]) if r else 0
+
+
+def set_project_approved(pid, val):
+    with DB_LOCK:
+        conn = _conn(); c = conn.cursor()
+        c.execute("UPDATE projects SET approved=? WHERE id=?", (int(val), pid))
+        conn.commit(); conn.close()
+
+
+def notify_admins_project_approval(pid, owner_uid, tg_user, file_path, extra_filename=None):
+    p = get_project(pid)
+    if not p:
+        return
+    uname = f"@{tg_user.username}" if getattr(tg_user, "username", None) else "لا يوجد"
+    fname = html.escape(getattr(tg_user, "first_name", None) or "مستخدم")
+    title = "📎 ملف إضافي لمشروع" if extra_filename else "📥 طلب تشغيل ملف جديد"
+    shown_file = extra_filename or p[5]
+    cap = (
+        "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"  <b>{title}</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👤 <b>المرسل:</b> {fname} ({uname})\n"
+        f"🆔 <b>الآيدي:</b> <code>{owner_uid}</code>\n"
+        f"📦 <b>المشروع:</b> <code>{html.escape(p[2])}</code> (ID: <code>{pid}</code>)\n"
+        f"🏷️ <b>النوع:</b> {type_label(p[3])}\n"
+        f"📄 <b>الملف:</b> <code>{html.escape(shown_file)}</code>\n"
+        f"📊 <b>الحجم:</b> <code>{get_file_size_str(file_path)}</code>"
+    )
+    am = types.InlineKeyboardMarkup(row_width=2)
+    am.row(
+        btn_green("✅ قبول التشغيل", f"adm_proj_ok_{pid}"),
+        btn_red("🛑 إيقاف / رفض", f"adm_proj_no_{pid}"),
+    )
+    send_path = file_path
+    tmp_zip = None
+    try:
+        all_files = [f for f in list_dir_files(p[4]) if not f.startswith(VENV_DIRNAME + os.sep) and f != ".deps_installed"]
+        if not extra_filename and len(all_files) > 1 and os.path.isdir(p[4]):
+            fd, tmp_zip = tempfile.mkstemp(suffix=".zip")
+            os.close(fd)
+            zip_project_dir(p[4], tmp_zip, exclude_dirnames=tuple(_BK_EXCL_DIRS))
+            if os.path.getsize(tmp_zip) <= TG_UPLOAD_LIMIT:
+                send_path = tmp_zip
+    except Exception:
+        pass
+
+    for aid in ADMIN_IDS:
+        try:
+            if os.path.isfile(send_path) and os.path.getsize(send_path) <= TG_UPLOAD_LIMIT:
+                with open(send_path, "rb") as f:
+                    vname = f"{owner_uid}_{os.path.basename(send_path)}" if tmp_zip else os.path.basename(send_path)
+                    bot.send_document(aid, f, caption=cap, parse_mode="HTML", reply_markup=am, visible_file_name=vname)
+            else:
+                bot.send_message(aid, cap, parse_mode="HTML", reply_markup=am)
+        except Exception as e:
+            print(f"[ApprovalNotify] {e}")
+    if tmp_zip:
+        try:
+            os.remove(tmp_zip)
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -983,6 +1106,10 @@ def _pretty_fail(msg, tail):
 
 def start_project(pid, watch=START_WATCH_SECONDS):
     """يشغّل المشروع. إذا مات بسبب مكتبة ناقصة، يثبّتها تلقائياً ويعيد التشغيل (حتى 5 محاولات)."""
+    appr = get_project_approved(pid)
+    if appr != 1:
+        msg_block = "⏳ هذا المشروع بانتظار موافقة الإدارة قبل التشغيل." if appr == 0 else "❌ تم رفض تشغيل هذا المشروع من قبل الإدارة."
+        return False, msg_block, None
     _START_PROGRESS[pid] = {"notes": [], "phase": "check", "t0": time.time()}
     installed, tried = [], set()
     ok, msg, info = False, "", None
@@ -3046,6 +3173,11 @@ def cb_restart_project(call):
     if not p or not can_access_project(p, uid):
         bot.answer_callback_query(call.id, "🚫 غير مصرح", show_alert=True)
         return
+    appr = get_project_approved(pid)
+    if appr != 1:
+        msg_block = "⏳ مشروعك بانتظار موافقة الإدارة قبل التشغيل." if appr == 0 else "❌ تم رفض تشغيل هذا المشروع من قبل الإدارة."
+        bot.answer_callback_query(call.id, msg_block, show_alert=True)
+        return
     bot.answer_callback_query(call.id, "🔁 جاري إعادة التشغيل...")
 
     def do():
@@ -3589,6 +3721,8 @@ def cb_proj(call):
     icon = type_label(p[3])
     files = get_project_files(pid)
 
+    appr = get_project_approved(pid)
+    appr_txt = "✅ معتمد" if appr == 1 else ("⏳ بانتظار موافقة الإدارة" if appr == 0 else "❌ مرفوض من الإدارة")
     txt = (
         "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"  <b>{p[2]}</b>\n"
@@ -3597,6 +3731,7 @@ def cb_proj(call):
         f"📄 <b>الملف:</b> <code>{p[5]}</code>\n"
         f"📁 <b>الملفات:</b> <code>{len(files)}</code>\n"
         f"📊 <b>الحالة:</b> {'🟢 شغال' if running else '🔴 متوقف'}\n"
+        f"🔐 <b>الموافقة:</b> {appr_txt}\n"
         f"⏱️ <b>المدة:</b> <code>{up}</code>\n"
         f"🆔 <b>PID:</b> <code>{p[14] or '—'}</code>\n"
     )
@@ -3646,6 +3781,12 @@ def cb_start(call):
     p = get_project(pid)
     if not p or not can_access_project(p, uid):
         bot.answer_callback_query(call.id, "🚫 غير مصرح", show_alert=True)
+        return
+
+    appr = get_project_approved(pid)
+    if appr != 1:
+        msg_block = "⏳ مشروعك بانتظار موافقة الإدارة قبل التشغيل." if appr == 0 else "❌ تم رفض تشغيل هذا المشروع من قبل الإدارة."
+        bot.answer_callback_query(call.id, msg_block, show_alert=True)
         return
 
     msg = bot.send_message(call.message.chat.id, "⏳ جاري التجهيز...",
@@ -4578,6 +4719,8 @@ def handle_doc(msg):
 
             pid = add_project(uid, name, ptype, pdir, entry)
             add_project_file(pid, entry)
+            _trusted_now = is_trusted_user(uid)
+            set_project_approved(pid, 1 if _trusted_now else 0)
 
             try:
                 backup_project_to_storage(pid)
@@ -4608,6 +4751,8 @@ def handle_doc(msg):
                 conn.close()
 
             log_action(uid, "upload_file", f"pid={pid} file={entry}")
+            if not _trusted_now:
+                notify_admins_project_approval(pid, uid, msg.from_user, entry_path)
 
             txt = (
                 "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -4626,6 +4771,8 @@ def handle_doc(msg):
                     f"  🔗 الرابط: https://t.me/{info['username']}\n\n"
                 )
 
+            if not _trusted_now:
+                txt += "⏳ <b>حالة الموافقة:</b> تم إرسال الملف للإدارة للمراجعة، ولن يتم تشغيله حتى تتم الموافقة عليه.\n\n"
             txt += (
                 "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
                 "<b><u>📝 الخطوة التالية:</u></b>\n\n"
@@ -4730,6 +4877,12 @@ def handle_doc(msg):
             ok, chk = check_any_file(fp)
             add_project_file(pid, filename)
             del user_states[uid]
+            _trusted_add = is_trusted_user(uid)
+            if not _trusted_add:
+                if is_running(pid):
+                    stop_project(pid)
+                set_project_approved(pid, 0)
+                notify_admins_project_approval(pid, uid, msg.from_user, fp, extra_filename=filename)
 
             txt = (
                 "<b>✅ تم اضافة الملف</b>\n\n"
@@ -4741,6 +4894,8 @@ def handle_doc(msg):
                 txt += "🔍 الفحص: ✅ سليم"
             else:
                 txt += f"⚠️ <b>تحذير:</b>\n{chk}"
+            if not _trusted_add:
+                txt += "\n\n⏳ <b>تنبيه:</b> تم إرسال الملف المضاف للإدارة للمراجعة قبل التشغيل."
 
             m = types.InlineKeyboardMarkup()
             m.add(btn_gray("🔙 رجوع", f"proj_{pid}"))
@@ -5056,6 +5211,7 @@ def cb_admin(call):
     m.row(btn_blue("🔗 Tunnel", "admin_tunnel"), btn_green("🌐 ويب المراقبة (OK)", "admin_demo_web"))
     m.row(btn_blue("📥 تخزين المطوّر", "admin_storage_0"), btn_blue("💳 المدفوعات والباقات", "admin_billing"))
     m.row(btn_blue("📋 سجل الاحداث", "admin_logs"), btn_green("🔓 فك حظر", "admin_unban"))
+    m.row(btn_green("✅ مستخدمين بدون موافقة", "admin_trusted_users"))
     mode_lbl = "💰 الوضع: مدفوع 💎" if is_paid_mode() else "🆓 الوضع: مجاني"
     m.row(btn_green("🎨 تخصيص البوت (أزرار + نصوص + نسخ)", "admin_premium"))
     m.row(btn_blue("✏️ تغيير اسم البوت", "admin_bot_name"), btn_blue("🖼 تغيير صورة البوت", "admin_bot_photo"))
@@ -5960,6 +6116,192 @@ def cb_toggle_demo_ping(call):
     cb_admin_demo_web(call)
 
 
+
+
+# ============================================================
+# ✅ نظام موافقة الأدمن على تشغيل الملفات + المستخدمين بدون موافقة
+# ============================================================
+@bot.callback_query_handler(func=lambda c: c.data.startswith(("adm_proj_ok_", "adm_proj_no_")))
+def cb_adm_proj_approval(call):
+    uid = call.from_user.id
+    if not is_admin(uid):
+        bot.answer_callback_query(call.id, "🚫 غير مصرح", show_alert=True)
+        return
+    approve = call.data.startswith("adm_proj_ok_")
+    try:
+        pid = int(call.data.rsplit("_", 1)[1])
+    except Exception:
+        return
+    p = get_project(pid)
+    if not p:
+        bot.answer_callback_query(call.id, "❌ المشروع غير موجود", show_alert=True)
+        return
+
+    chat_id = call.message.chat.id
+    mid = call.message.message_id
+
+    if not approve:
+        set_project_approved(pid, -1)
+        stop_project(pid)
+        log_action(uid, "reject_project", f"pid={pid} owner={p[1]}")
+        bot.answer_callback_query(call.id, "🛑 تم إيقاف / رفض التشغيل")
+        status_line = f"🛑 <b>الحالة:</b> تم الإيقاف / الرفض بواسطة الإدارة\\n📦 <b>المشروع:</b> <code>{html.escape(p[2])}</code>"
+        m = types.InlineKeyboardMarkup()
+        m.add(btn_green("✅ قبول التشغيل", f"adm_proj_ok_{pid}"))
+        try:
+            if call.message.document:
+                bot.edit_message_caption(status_line, chat_id, mid, parse_mode="HTML", reply_markup=m)
+            else:
+                bot.edit_message_text(status_line, chat_id, mid, parse_mode="HTML", reply_markup=m)
+        except Exception:
+            bot.send_message(chat_id, status_line, parse_mode="HTML", reply_markup=m)
+        try:
+            bot.send_message(p[1], f"🛑 تم إيقاف / رفض تشغيل مشروعك <b>{html.escape(p[2])}</b> من قبل الإدارة.", parse_mode="HTML")
+        except Exception:
+            pass
+        return
+
+    set_project_approved(pid, 1)
+    log_action(uid, "approve_project", f"pid={pid} owner={p[1]}")
+    bot.answer_callback_query(call.id, "✅ تم القبول وجاري التشغيل...")
+
+    def _run_approved():
+        ok, res_msg, info = start_project(pid)
+        m = types.InlineKeyboardMarkup()
+        m.add(btn_red("🛑 إيقاف التشغيل", f"adm_proj_no_{pid}"))
+        if ok:
+            status_line = f"✅ <b>الحالة:</b> تم القبول والتشغيل بنجاح\\n📦 <b>المشروع:</b> <code>{html.escape(p[2])}</code> (PID: <code>{info.get('pid') if info else '-'}</code>)"
+            try:
+                bot.send_message(p[1], f"✅ تمت الموافقة على مشروعك <b>{html.escape(p[2])}</b> وتم تشغيله بنجاح!", parse_mode="HTML")
+            except Exception:
+                pass
+        else:
+            status_line = f"✅ <b>الحالة:</b> تمت الموافقة على المشروع، لكن تعذّر التشغيل التلقائي:\\n{res_msg[:400]}"
+            try:
+                bot.send_message(p[1], f"✅ تمت الموافقة على مشروعك <b>{html.escape(p[2])}</b>! يمكنك الآن تشغيله أو فحص السجلات من قائمة مشاريعك.", parse_mode="HTML")
+            except Exception:
+                pass
+        try:
+            if call.message.document:
+                bot.edit_message_caption(status_line, chat_id, mid, parse_mode="HTML", reply_markup=m)
+            else:
+                bot.edit_message_text(status_line, chat_id, mid, parse_mode="HTML", reply_markup=m)
+        except Exception:
+            bot.send_message(chat_id, status_line, parse_mode="HTML", reply_markup=m)
+
+    threading.Thread(target=_run_approved, daemon=True).start()
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "admin_trusted_users")
+def cb_admin_trusted(call):
+    if not is_admin(call.from_user.id):
+        return
+    user_states.pop(call.from_user.id, None)
+    trusted = get_all_trusted_users()
+    lines = [
+        make_header("✅ مستخدمين بدون موافقة"),
+        "",
+        "الأعضاء في هذه القائمة تعمل ملفاتهم على الاستضافة مباشرة بدون انتظار موافقة الأدمن:",
+        "",
+    ]
+    m = types.InlineKeyboardMarkup(row_width=1)
+    m.add(btn_green("➕ إضافة عضو (آيدي أو يوزر)", "adm_add_trusted"))
+    if not trusted:
+        lines.append("📭 لا يوجد أعضاء مضافون حالياً.")
+    else:
+        for t_uid, t_uname, t_fname, _, t_at in trusted[:25]:
+            u_db = get_user(t_uid)
+            disp_name = t_fname or (u_db[2] if u_db and u_db[2] else "")
+            disp_user = t_uname or (u_db[1] if u_db and u_db[1] else "")
+            tag = f" (@{disp_user})" if disp_user else ""
+            lines.append(f"• <code>{t_uid}</code> {html.escape(disp_name)}{tag}")
+            m.add(btn_red(f"🗑 إزالة {t_uid} {disp_name[:15]}".strip(), f"adm_del_trusted_{t_uid}"))
+    m.add(btn_gray("🔙 رجوع", "admin_panel"))
+    txt = "\\n".join(lines)
+    try:
+        bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=m, parse_mode="HTML")
+    except Exception:
+        bot.send_message(call.message.chat.id, txt, reply_markup=m, parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "adm_add_trusted")
+def cb_adm_add_trusted(call):
+    if not is_admin(call.from_user.id):
+        return
+    user_states[call.from_user.id] = "waiting_trusted_user"
+    m = types.InlineKeyboardMarkup()
+    m.add(btn_red("❌ إلغاء", "admin_trusted_users"))
+    txt = (
+        f"{make_header('➕ إضافة عضو بدون موافقة')}\\n\\n"
+        "📤 أرسل الآن <b>آيدي المستخدم</b> (مثال: <code>123456789</code>)\\n"
+        "أو <b>اليوزر</b> (مثال: <code>@username</code>) أو قم بتحويل رسالة منه:"
+    )
+    bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=m, parse_mode="HTML")
+
+
+@bot.message_handler(func=lambda m: not (m.text or "").startswith("/") and user_states.get(m.from_user.id) == "waiting_trusted_user")
+def do_add_trusted(msg):
+    uid = msg.from_user.id
+    if not is_admin(uid):
+        return
+    target_id = None
+    uname = ""
+    fname = ""
+    if getattr(msg, "forward_from", None):
+        target_id = msg.forward_from.id
+        uname = msg.forward_from.username or ""
+        fname = msg.forward_from.first_name or ""
+    else:
+        raw = (msg.text or "").strip()
+        if raw.isdigit():
+            target_id = int(raw)
+            u_db = get_user(target_id)
+            if u_db:
+                uname = u_db[1] or ""
+                fname = u_db[2] or ""
+        else:
+            found = find_user_by_username(raw)
+            if found:
+                target_id, uname, fname = found[0], found[1] or "", found[2] or ""
+            else:
+                bot.reply_to(
+                    msg,
+                    "❌ لم يتم العثور على هذا اليوزر في قاعدة البيانات (يجب أن يكون قد بدأ البوت مسبقاً، أو أرسل <b>الآيدي الرقمي</b> مباشرة).",
+                    parse_mode="HTML",
+                )
+                return
+
+    user_states.pop(uid, None)
+    add_trusted_user(target_id, uname, fname, added_by=uid)
+    log_action(uid, "add_trusted_user", f"target={target_id}")
+    m = types.InlineKeyboardMarkup()
+    m.add(btn_gray("🔙 رجوع للقائمة", "admin_trusted_users"))
+    bot.reply_to(
+        msg,
+        f"✅ تم تفعيل الاستضافة بدون موافقة للعضو <code>{target_id}</code> {html.escape(fname)}.",
+        parse_mode="HTML",
+        reply_markup=m,
+    )
+    try:
+        bot.send_message(target_id, "🎉 تم تفعيل التشغيل المباشر لحسابك! يمكنك الآن رفع وتشغيل ملفاتك بدون انتظار موافقة الإدارة.")
+    except Exception:
+        pass
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("adm_del_trusted_"))
+def cb_adm_del_trusted(call):
+    if not is_admin(call.from_user.id):
+        return
+    try:
+        target_id = int(call.data[len("adm_del_trusted_"):])
+    except Exception:
+        return
+    remove_trusted_user(target_id)
+    log_action(call.from_user.id, "remove_trusted_user", f"target={target_id}")
+    bot.answer_callback_query(call.id, "✅ تم إزالة العضو")
+    cb_admin_trusted(call)
+
+
 # ============================================================
 # Flask + Web Dashboard
 # ============================================================
@@ -6269,6 +6611,8 @@ def w_start(pid):
     p = get_project(pid)
     if not p or not can_access_project(p, uid):
         return "🚫 غير مصرح", 403
+    if get_project_approved(pid) != 1:
+        return "⏳ المشروع بانتظار موافقة الإدارة أو مرفوض", 403
 
     ok, msg, _ = start_project(pid)
     return f"""<body style='background:#0f172a;color:#e2e8f0;text-align:center;padding:100px;font-family:sans-serif'>
@@ -7079,10 +7423,38 @@ def run_bot():
             time.sleep(5)
 
 
+def _is_port_free(port):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("0.0.0.0", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
 def run_web():
     port = int(os.environ.get("PORT", 8080))
-    print(f"[Web] http://0.0.0.0:{port}")
-    web.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True)
+    if not _is_port_free(port):
+        fallback = get_free_port()
+        print(f"[Web] Port {port} in use, switching to {fallback}")
+        port = fallback
+    for _ in range(10):
+        try:
+            print(f"[Web] http://0.0.0.0:{port}")
+            web.run(host="0.0.0.0", port=port, debug=False, use_reloader=False, threaded=True)
+            break
+        except OSError as e:
+            if "Address already in use" in str(e) or getattr(e, "errno", None) in (98, 48, 10048):
+                port = get_free_port()
+                print(f"[Web] Port busy, retrying on {port}")
+                continue
+            print(f"[Web] Error: {e}")
+            break
 
 
 # ============================================================
