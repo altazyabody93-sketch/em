@@ -15,14 +15,18 @@ from datetime import datetime, timedelta
 
 import telebot
 from telebot import types
-from flask import Flask, render_template_string, request, Response
+from flask import Flask, render_template_string, request, Response, jsonify
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 
 # ============================================================
 # ضمان المكتبات
 # ============================================================
 def ensure_packages():
-    pkgs = {"telebot": "pyTelegramBotAPI", "flask": "flask", "requests": "requests"}
+    pkgs = {"telebot": "pyTelegramBotAPI", "flask": "flask", "requests": "requests", "psutil": "psutil"}
     missing = []
     for imp, pip_name in pkgs.items():
         try:
@@ -63,6 +67,197 @@ START_TIME = datetime.now()
 PORT_COUNTER = 7000
 TUNNEL_URL = None
 DB_LOCK = threading.RLock()
+
+BACKUPS_24H_DIR = os.path.join(DATA_DIR, "backups_24h")
+os.makedirs(BACKUPS_24H_DIR, exist_ok=True)
+SESSIONS_BACKUP_DIR = os.path.join(DATA_DIR, "session_backups")
+os.makedirs(SESSIONS_BACKUP_DIR, exist_ok=True)
+
+PLANS = {
+    "free": {"name": "المجانية (Free)", "emoji": "🆓", "max_projects": 3, "price": 0.0, "vip": 0},
+    "pro":  {"name": "الاحترافية (Pro)", "emoji": "⚡", "max_projects": 8, "price": 5.0, "vip": 0},
+    "vip":  {"name": "الفاخرة (VIP)", "emoji": "👑", "max_projects": 25, "price": 12.0, "vip": 1},
+}
+
+NODE_BUILTINS = {
+    "fs", "path", "os", "http", "https", "url", "util", "crypto", "stream",
+    "events", "child_process", "cluster", "dns", "net", "tls", "dgram",
+    "readline", "zlib", "buffer", "assert", "querystring", "timers", "tty",
+    "process", "worker_threads", "perf_hooks", "async_hooks", "vm",
+}
+
+def load_project_env_dict(pdir):
+    env_vars = {}
+    ep = os.path.join(pdir, ".env")
+    if os.path.isfile(ep):
+        try:
+            with open(ep, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    s = line.strip()
+                    if not s or s.startswith("#") or "=" not in s:
+                        continue
+                    k, v = s.split("=", 1)
+                    env_vars[k.strip()] = v.strip().strip('"').strip("'")
+        except Exception:
+            pass
+    return env_vars
+
+def detect_entry_and_type(pdir, preferred_ptype=None):
+    all_files = list_dir_files(pdir)
+    clean_files = [f for f in all_files if not f.startswith(("__MACOSX", ".git", "node_modules", ".venv"))]
+    py_files = [f for f in clean_files if f.endswith(".py")]
+    js_files = [f for f in clean_files if f.endswith((".js", ".mjs", ".cjs"))]
+
+    pkg_path = os.path.join(pdir, "package.json")
+    if os.path.isfile(pkg_path):
+        try:
+            with open(pkg_path, "r", encoding="utf-8", errors="ignore") as f:
+                pkg = json.load(f)
+            main_f = pkg.get("main", "")
+            if main_f and os.path.isfile(os.path.join(pdir, main_f)):
+                return "node", main_f
+            sc = (pkg.get("scripts") or {}).get("start", "")
+            m = re.search(r"node\s+([^\s&|;]+)", sc)
+            if m and os.path.isfile(os.path.join(pdir, m.group(1))):
+                return "node", m.group(1)
+        except Exception:
+            pass
+
+    if preferred_ptype == "node" or (not py_files and js_files):
+        for cand in ("index.js", "bot.js", "app.js", "server.js", "main.js", "index.mjs"):
+            if cand in js_files:
+                return "node", cand
+        if js_files:
+            return "node", js_files[0]
+
+    for cand in ("main.py", "bot.py", "app.py", "run.py", "server.py", "index.py"):
+        if cand in py_files:
+            return (preferred_ptype if preferred_ptype in ("bot", "web", "script") else "bot"), cand
+    if py_files:
+        return (preferred_ptype if preferred_ptype in ("bot", "web", "script") else "bot"), py_files[0]
+
+    if js_files:
+        return "node", js_files[0]
+    return None, None
+
+def ensure_node_package_json(pdir, entry_file):
+    pkg_path = os.path.join(pdir, "package.json")
+    if os.path.isfile(pkg_path):
+        return False
+    deps = {}
+    rx = re.compile(r"""(?:require\s*\(\s*['"]([^'"./][^'"]*)['"]\s*\)|import\s+.*?\s+from\s+['"]([^'"./][^'"]*)['"])""")
+    for root, dirs, files in os.walk(pdir):
+        dirs[:] = [d for d in dirs if d not in ("node_modules", ".git")]
+        for fn in files:
+            if fn.endswith((".js", ".mjs", ".cjs")):
+                try:
+                    with open(os.path.join(root, fn), "r", encoding="utf-8", errors="ignore") as f:
+                        txt = f.read()
+                    for m in rx.finditer(txt):
+                        pkg = (m.group(1) or m.group(2) or "").strip()
+                        if pkg.startswith("node:"):
+                            continue
+                        pkg = "/".join(pkg.split("/")[:2]) if pkg.startswith("@") else pkg.split("/")[0]
+                        if pkg and pkg not in NODE_BUILTINS:
+                            deps[pkg] = "latest"
+                except Exception:
+                    pass
+    data = {
+        "name": re.sub(r"[^a-z0-9-]", "-", os.path.basename(pdir).lower()),
+        "version": "1.0.0",
+        "main": entry_file,
+        "scripts": {"start": f"node {entry_file}"},
+        "dependencies": deps,
+    }
+    with open(pkg_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    return True
+
+def extract_bot_info_project(pdir):
+    rx = re.compile(r'\b([0-9]{8,12}:[A-Za-z0-9_-]{30,50})\b')
+    found = None
+    for root, dirs, files in os.walk(pdir):
+        dirs[:] = [d for d in dirs if d not in ("node_modules", ".venv", ".pylibs", ".git", "__pycache__")]
+        for fn in files:
+            if not (fn.endswith((".py", ".js", ".mjs", ".cjs", ".json", ".txt")) or fn == ".env"):
+                continue
+            fp = os.path.join(root, fn)
+            try:
+                if os.path.getsize(fp) > 2 * 1024 * 1024:
+                    continue
+                with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+                    m = rx.search(f.read())
+                if m:
+                    found = m.group(1)
+                    break
+            except Exception:
+                continue
+        if found:
+            break
+    info = {"token": None, "username": None, "name": None}
+    if not found:
+        return info
+    info["token"] = found
+    try:
+        import requests as req
+        r = req.get(f"https://api.telegram.org/bot{found}/getMe", timeout=8)
+        if r.status_code == 200 and r.json().get("ok"):
+            res = r.json()["result"]
+            info["username"] = res.get("username")
+            info["name"] = res.get("first_name")
+    except Exception:
+        pass
+    return info
+
+def get_server_metrics():
+    if not psutil:
+        return {"cpu": 0.0, "ram_pct": 0.0, "ram_used": 0.0, "ram_total": 0.0, "disk_pct": 0.0, "disk_used": 0.0, "disk_total": 0.0}
+    vm = psutil.virtual_memory()
+    dk = psutil.disk_usage("/")
+    return {
+        "cpu": round(psutil.cpu_percent(interval=0.1), 1),
+        "ram_pct": round(vm.percent, 1),
+        "ram_used": round(vm.used / (1024**3), 2),
+        "ram_total": round(vm.total / (1024**3), 2),
+        "disk_pct": round(dk.percent, 1),
+        "disk_used": round(dk.used / (1024**3), 2),
+        "disk_total": round(dk.total / (1024**3), 2),
+    }
+
+def get_proc_metrics(pid_num):
+    if not psutil or not pid_num:
+        return 0.0, 0.0
+    try:
+        ps = psutil.Process(int(pid_num))
+        cpu = ps.cpu_percent(interval=0.05)
+        mem = ps.memory_info().rss / (1024 * 1024)
+        for ch in ps.children(recursive=True):
+            try:
+                cpu += ch.cpu_percent(interval=0.02)
+                mem += ch.memory_info().rss / (1024 * 1024)
+            except Exception:
+                pass
+        return round(cpu, 1), round(mem, 1)
+    except Exception:
+        return 0.0, 0.0
+
+def local_24h_backup_loop():
+    while True:
+        time.sleep(24 * 3600)
+        try:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            dest = os.path.join(BACKUPS_24H_DIR, f"auto_24h_{ts}.zip")
+            zip_project_dir(PROJECTS_DIR, dest, exclude_dirnames=tuple(_BK_EXCL_DIRS))
+            baks = sorted([os.path.join(BACKUPS_24H_DIR, x) for x in os.listdir(BACKUPS_24H_DIR) if x.endswith(".zip")])
+            for old in baks[:-5]:
+                try:
+                    os.remove(old)
+                except Exception:
+                    pass
+            log_action(0, "auto_backup_24h", os.path.basename(dest))
+        except Exception as e:
+            print(f"[Backup24h] {e}")
+
 
 
 # ============================================================
@@ -594,6 +789,9 @@ def get_public_url():
         ("REPLIT_DEV_DOMAIN", "https://{}"), ("NORTHFLANK_URL", "https://{}"),
         ("ADAPTABLE_URL", "https://{}"), ("FL0_DOMAIN", "https://{}"),
         ("PUBLIC_URL", "{}"), ("APP_URL", "{}"), ("SERVER_DOMAIN", "https://{}"),
+        ("SPACE_HOST", "https://{}"),
+        ("CODESPACE_NAME", "https://{}.github.dev"),
+        ("CLOUDFLARE_TUNNEL_URL", "{}"),
     ]
     for env_key, fmt in platforms:
         v = os.environ.get(env_key)
@@ -810,6 +1008,18 @@ def check_requirements_file(fp):
     except Exception as e: return False, f"❌ خطأ: {e}"
 
 
+
+def check_js_file(fp):
+    try:
+        node_bin = shutil.which("node")
+        if node_bin:
+            r = subprocess.run([node_bin, "--check", fp], capture_output=True, text=True, timeout=10)
+            if r.returncode != 0:
+                return False, f"<b>❌ خطأ JavaScript</b>\n<pre>{html.escape((r.stderr or r.stdout)[-400:])}</pre>"
+        return True, f"<b>✅ JavaScript سليم</b>\n📄 <code>{os.path.basename(fp)}</code> ({get_file_size_str(fp)})"
+    except Exception as e:
+        return True, f"ℹ️ JS: {e}"
+
 def check_any_file(fp):
     if not os.path.exists(fp): return False, "<b>❌ الملف غير موجود</b>"
     name = os.path.basename(fp).lower()
@@ -817,6 +1027,7 @@ def check_any_file(fp):
     elif name.endswith(".py"): return check_python_file(fp)
     elif name.endswith(".json"): return check_json_file(fp)
     elif name.endswith(".sh"): return check_shell_file(fp)
+    elif name.endswith((".js", ".mjs", ".cjs")): return check_js_file(fp)
     elif name.endswith(".txt"): return check_requirements_file(fp)
     else:
         size = get_file_size_str(fp)
@@ -939,6 +1150,12 @@ def _start_project_once(pid, watch=START_WATCH_SECONDS):
         env = os.environ.copy()
         _pl = os.path.join(p[4], PYLIBS_DIRNAME)
         env["PYTHONPATH"] = _pl + os.pathsep + env.get("PYTHONPATH", "")
+        env["NODE_PATH"] = os.path.join(p[4], "node_modules")
+        _vbin = os.path.join(p[4], VENV_DIRNAME, "bin")
+        if os.path.isdir(_vbin):
+            env["VIRTUAL_ENV"] = os.path.join(p[4], VENV_DIRNAME)
+            env["PATH"] = _vbin + os.pathsep + env.get("PATH", "")
+        env.update(load_project_env_dict(p[4]))
         port = 0
         public_url = ""
 
@@ -995,18 +1212,25 @@ def _start_project_once(pid, watch=START_WATCH_SECONDS):
                 except Exception:
                     pass
             cmd = [py_exe, "-u", p[5]]
-        elif p[5].endswith(".js"):
+        elif p[5].endswith((".js", ".mjs", ".cjs")):
             node_bin = shutil.which("node")
             if not node_bin:
                 return False, ("❌ Node.js غير مثبت على السيرفر.\n"
                                 "ثبّته أولاً: <code>pkg install nodejs</code> (Termux) "
                                 "أو <code>apt install nodejs npm</code>"), None
-            pkg_json = os.path.join(p[4], "package.json")
-            if os.path.exists(pkg_json) and not os.path.exists(os.path.join(p[4], "node_modules")):
-                _log_line("📦 npm install ...")
+            _sp(pid, phase="install", note="🟨 تجهيز بيئة Node.js...")
+            created_pkg = ensure_node_package_json(p[4], p[5])
+            if created_pkg:
+                _log_line("📝 تم إنشاء package.json تلقائياً")
+                _sp(pid, note="📝 تم توليد package.json")
+            if not os.path.exists(os.path.join(p[4], "node_modules")):
+                use_yarn = os.path.isfile(os.path.join(p[4], "yarn.lock")) and shutil.which("yarn")
+                inst_cmd = ["yarn", "install"] if use_yarn else ["npm", "install", "--no-audit", "--no-fund"]
+                _log_line(f"📦 {' '.join(inst_cmd)} ...")
+                _sp(pid, note=f"📦 جاري تشغيل {inst_cmd[0]} install...")
                 try:
-                    subprocess.run(["npm", "install", "--no-audit", "--no-fund"], cwd=p[4],
-                                   stdout=lf, stderr=subprocess.STDOUT, timeout=600)
+                    r_npm = subprocess.run(inst_cmd, cwd=p[4], stdout=lf, stderr=subprocess.STDOUT, timeout=600)
+                    _sp(pid, note="✅ اكتمل تثبيت حزم Node.js" if r_npm.returncode == 0 else "⚠️ تحذير أثناء التثبيت")
                 except Exception as e:
                     _log_line(f"⚠️ npm install: {e}")
             cmd = [node_bin, p[5]]
@@ -2047,7 +2271,7 @@ def _scan_source(src):
                 else:
                     merged.append(("p", _ph_name(val, used)))
             static = "".join(v for k, v in merged if k == "s")
-            if len(static.strip()) < 15 or len(re.findall(r"[\u0600-\u06FFA-Za-z]", static)) < 6:
+            if len(static.strip()) < 6 or len(re.findall(r"[\u0600-\u06FFA-Za-z]", static)) < 3:
                 return
             if sum(1 for k, _ in merged if k == "p") > 16:
                 return
@@ -2964,6 +3188,31 @@ def _entities_to_html(text, entities):
     return "".join(out)
 
 
+
+_PTPL_PREVIEW = {}
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("ptpl_save_"))
+def cb_ptpl_save(call):
+    if not is_admin(call.from_user.id):
+        return
+    tid = call.data[len("ptpl_save_"):]
+    new = _PTPL_PREVIEW.pop(tid, None)
+    if not new:
+        bot.answer_callback_query(call.id, "⚠️ انتهت المعاينة، أرسل النص مجدداً", show_alert=True)
+        return
+    with DB_LOCK:
+        conn = _conn(); c = conn.cursor()
+        c.execute("REPLACE INTO tpl_custom (tid, text) VALUES (?, ?)", (tid, new))
+        conn.commit(); conn.close()
+    _load_tpl_cache()
+    bot.answer_callback_query(call.id, "✅ تم الحفظ!")
+    bot.edit_message_text(
+        "✅ تم حفظ القالب وتفعيله فوراً.",
+        call.message.chat.id,
+        call.message.message_id,
+        reply_markup=types.InlineKeyboardMarkup().add(btn_green("📝 عرض القالب", f"ptpl_v_{tid}")),
+    )
+
 @bot.message_handler(func=lambda m: not (m.text or "").startswith("/") and user_states.get(m.from_user.id, "").startswith("waiting_ptpl_"))
 def _do_ptpl_input(msg):
     uid = msg.from_user.id
@@ -2982,12 +3231,18 @@ def _do_ptpl_input(msg):
         bot.reply_to(msg, f"❌ {why}\nالمتاح: {' '.join('{'+n+'}' for n in info['names']) or '-'}")
         user_states[uid] = f"waiting_ptpl_{tid}"
         return
-    with DB_LOCK:
-        conn = _conn(); c = conn.cursor()
-        c.execute("REPLACE INTO tpl_custom (tid, text) VALUES (?, ?)", (tid, new))
-        conn.commit(); conn.close()
-    _load_tpl_cache()
-    bot.send_message(msg.chat.id, "✅ تم حفظ النص.", reply_markup=types.InlineKeyboardMarkup().add(btn_green("📝 عرض", f"ptpl_v_{tid}")))
+    _PTPL_PREVIEW[tid] = new
+    sample = {n: f"[{n}]" for n in info["names"]}
+    rendered = _render_tpl(new, sample)
+    pm = types.InlineKeyboardMarkup(row_width=2)
+    pm.row(btn_green("✅ تأكيد وحفظ", f"ptpl_save_{tid}"), btn_blue("✏️ تعديل مرة أخرى", f"ptpl_e_{tid}"))
+    pm.add(btn_red("❌ إلغاء", f"ptpl_v_{tid}"))
+    bot.send_message(
+        msg.chat.id,
+        f"{make_header('👁️ معاينة حية قبل الحفظ')}\n\n{rendered}",
+        reply_markup=pm,
+        parse_mode="HTML",
+    )
 
 
 # ============================================================
@@ -3554,6 +3809,7 @@ def main_menu(uid):
         else:
             m.add(btns[0])
 
+    m.add(btn_blue("📊 حالة السيرفر", "server_monitor"))
     if is_admin(uid):
         m.add(make_custom_btn("btn_admin", cb="admin_panel"))
 
@@ -3734,6 +3990,8 @@ def cb_proj(call):
         f"🔐 <b>الموافقة:</b> {appr_txt}\n"
         f"⏱️ <b>المدة:</b> <code>{up}</code>\n"
         f"🆔 <b>PID:</b> <code>{p[14] or '—'}</code>\n"
+        + (f"📊 <b>الموارد:</b> <code>CPU {get_proc_metrics(p[14])[0]}% | RAM {get_proc_metrics(p[14])[1]} MB</code>\n" if running else "")
+        + ("⚠️ <i>لم يتم اكتشاف توكن بوت تيليجرام في المشروع</i>\n" if not p[8] else "")
     )
 
     if p[3] == "web" and p[12]:
@@ -3750,9 +4008,10 @@ def cb_proj(call):
         m.row(btn_blue("🌐 فتح الموقع", f"openweb_{pid}"))
 
     if p[9]:
-        m.row(btn_blue("🤖 فتح البوت", url=f"https://t.me/{p[9]}"))
+        m.row(btn_green("🚀 دخول للبوت", url=f"https://t.me/{p[9]}"))
 
-    m.row(btn_blue("📁 الملفات", f"files_{pid}"), btn_blue("➕ اضافة ملف", f"addfile_{pid}"))
+    m.row(btn_blue("📁 مدير الملفات", f"pfiles_{pid}:0"), btn_blue("🔐 محرر .env", f"penv_{pid}"))
+    m.row(btn_blue("💾 حفظ الجلسة", f"sess_save_{pid}"), btn_red("🔄 إعادة تعيين الجلسة", f"sess_reset_{pid}"))
     m.row(btn_blue("🔍 فحص", f"check_{pid}"), btn_blue("⚙️ مكتبة", f"addpkg_{pid}"))
     if p[5].endswith(".py"):
         m.row(btn_green("🪄 تثبيت تلقائي ذكي", f"smart_{pid}"))
@@ -3865,12 +4124,15 @@ def cb_stop(call):
 # ============================================================
 # السجلات
 # ============================================================
-@bot.callback_query_handler(func=lambda c: c.data.startswith("logs_"))
+@bot.callback_query_handler(func=lambda c: c.data.startswith(("logs_", "logs_live_", "logs_dl_")))
 def cb_logs(call):
     uid = call.from_user.id
+    is_dl = call.data.startswith("logs_dl_")
+    is_live = call.data.startswith("logs_live_")
+    pid_str = call.data.split("_")[-1]
     try:
-        pid = int(call.data[5:])
-    except:
+        pid = int(pid_str)
+    except Exception:
         return
 
     p = get_project(pid)
@@ -3878,26 +4140,50 @@ def cb_logs(call):
         bot.answer_callback_query(call.id, "🚫 غير مصرح", show_alert=True)
         return
 
-    logs = get_logs(pid, 80)
-    if len(logs) > 3500:
-        logs = "...\n" + logs[-3500:]
+    if is_dl:
+        lp = os.path.join(p[4], "output.log")
+        if not os.path.isfile(lp):
+            return bot.answer_callback_query(call.id, "لا يوجد ملف سجل بعد", show_alert=True)
+        bot.answer_callback_query(call.id)
+        with open(lp, "rb") as f:
+            bot.send_document(call.message.chat.id, f, caption=f"📜 سجل {p[2]}", visible_file_name=f"{p[2]}_logs.txt")
+        return
 
-    txt = (
-        "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"  <b>📄 سجلات {p[2]}</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"<pre>{logs}</pre>"
-    )
+    def _build_log_msg():
+        raw = get_logs(pid, 80)
+        if len(raw) > 2800:
+            raw = "...\n" + raw[-2800:]
+        hint = next((h for k, h in _ERR_HINTS if k in raw), "")
+        diag = f"\n🚨 <b>تشخيص تلقائي:</b> {hint}\n" if hint else ""
+        t = (
+            "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"  <b>📄 السجلات الحية — {html.escape(p[2])}</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{diag}\n<pre>{html.escape(raw)}</pre>"
+        )
+        mk = types.InlineKeyboardMarkup(row_width=2)
+        mk.row(btn_blue("🔄 تحديث", f"logs_{pid}"), btn_green("📡 تحديث مباشر (15ث)", f"logs_live_{pid}"))
+        mk.row(btn_blue("📥 تحميل السجل", f"logs_dl_{pid}"), btn_gray("🔙 رجوع", f"proj_{pid}"))
+        return t, mk
 
-    m = types.InlineKeyboardMarkup()
-    m.row(btn_blue("🔄 تحديث", f"logs_{pid}"), btn_gray("🔙 رجوع", f"proj_{pid}"))
+    if is_live:
+        bot.answer_callback_query(call.id, "📡 جاري المراقبة الحية لـ 15 ثانية...")
+        def _live_loop():
+            for _ in range(3):
+                t, mk = _build_log_msg()
+                try:
+                    bot.edit_message_text(t, call.message.chat.id, call.message.message_id, reply_markup=mk, parse_mode="HTML")
+                except Exception:
+                    pass
+                time.sleep(5)
+        threading.Thread(target=_live_loop, daemon=True).start()
+        return
 
+    txt, m = _build_log_msg()
     try:
-        bot.edit_message_text(txt, call.message.chat.id, call.message.message_id,
-                             reply_markup=m, parse_mode="HTML")
-    except:
-        bot.send_message(call.message.chat.id, txt, reply_markup=m,
-                        parse_mode="HTML")
+        bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=m, parse_mode="HTML")
+    except Exception:
+        bot.send_message(call.message.chat.id, txt, reply_markup=m, parse_mode="HTML")
 
 
 # ============================================================
@@ -4339,6 +4625,7 @@ def cb_new(call):
     m = types.InlineKeyboardMarkup(row_width=2)
     m.row(btn_green("🐍 بوت Python", "type_bot"), btn_blue("🌐 موقع Web", "type_web"))
     m.row(btn_blue("📜 سكربت Python", "type_script"), btn_blue("🟨 بوت Node.js", "type_node"))
+    m.add(btn_green("🐙 استيراد من GitHub", "new_github"))
     m.add(btn_gray("❌ الغاء", "main_menu"))
 
     bot.edit_message_text(txt, call.message.chat.id, call.message.message_id,
@@ -4674,22 +4961,26 @@ def handle_doc(msg):
                         z.extractall(pdir)
                     os.remove(zip_path)
 
-                    all_files = list_dir_files(pdir)
-                    py_files = [f for f in all_files if f.endswith(".py")]
+                    # تسطيح المجلد إذا كان الـ ZIP يحتوي مجلداً واحداً بالداخل (مثل GitHub ZIP)
+                    top_items = [x for x in os.listdir(pdir) if x != "__MACOSX"]
+                    if len(top_items) == 1 and os.path.isdir(os.path.join(pdir, top_items[0])):
+                        inner_dir = os.path.join(pdir, top_items[0])
+                        for sub in os.listdir(inner_dir):
+                            shutil.move(os.path.join(inner_dir, sub), os.path.join(pdir, sub))
+                        shutil.rmtree(inner_dir, ignore_errors=True)
 
-                    if not py_files:
+                    all_files = list_dir_files(pdir)
+                    det_ptype, entry = detect_entry_and_type(pdir, ptype)
+                    if not entry:
                         bot.send_message(msg.chat.id,
-                            "❌ لا يوجد ملف .py في الـ ZIP", parse_mode="HTML")
+                            "❌ لم يتم العثور على ملف تشغيل صالح (.py أو .js أو package.json) في الـ ZIP", parse_mode="HTML")
                         shutil.rmtree(pdir, ignore_errors=True)
                         return
-
-                    entry = py_files[0]
-                    if "main.py" in py_files: entry = "main.py"
-                    elif "app.py" in py_files: entry = "app.py"
-                    elif "bot.py" in py_files: entry = "bot.py"
+                    ptype = det_ptype or ptype
 
                     bot.send_message(msg.chat.id,
                         f"📦 تم فك الـ ZIP ({len(all_files)} ملف)\n"
+                        f"🏷️ النوع المكتشف: {type_label(ptype)}\n"
                         f"🎯 الملف الرئيسي: <code>{entry}</code>",
                         parse_mode="HTML")
                 except Exception as e:
@@ -4713,9 +5004,7 @@ def handle_doc(msg):
                 shutil.rmtree(pdir, ignore_errors=True)
                 return
 
-            info = {"token": None, "username": None, "name": None}
-            if ptype == "bot":
-                info = extract_bot_info(entry_path)
+            info = extract_bot_info_project(pdir)
 
             pid = add_project(uid, name, ptype, pdir, entry)
             add_project_file(pid, entry)
@@ -4770,6 +5059,8 @@ def handle_doc(msg):
                     f"  👤 اليوزر: @{info['username']}\n"
                     f"  🔗 الرابط: https://t.me/{info['username']}\n\n"
                 )
+            elif not info.get("token"):
+                txt += "⚠️ <b>تنبيه:</b> لم يتم اكتشاف توكن بوت تيليجرام (BOT_TOKEN) في ملفات المشروع.\n\n"
 
             if not _trusted_now:
                 txt += "⏳ <b>حالة الموافقة:</b> تم إرسال الملف للإدارة للمراجعة، ولن يتم تشغيله حتى تتم الموافقة عليه.\n\n"
@@ -6302,6 +6593,132 @@ def cb_adm_del_trusted(call):
     cb_admin_trusted(call)
 
 
+
+# ============================================================
+# 🐙 الاستيراد المباشر من GitHub + 💾 إدارة الجلسات + 📊 مراقبة السيرفر
+# ============================================================
+@bot.callback_query_handler(func=lambda c: c.data == "new_github")
+def cb_new_github(call):
+    uid = call.from_user.id
+    ok, count, limit = check_user_limit(uid)
+    if not ok:
+        return bot.answer_callback_query(call.id, f"⚠️ وصلت للحد الأقصى ({count}/{limit})", show_alert=True)
+    user_states[uid] = "waiting_github_repo"
+    m = types.InlineKeyboardMarkup().add(btn_red("❌ إلغاء", "main_menu"))
+    bot.edit_message_text(
+        f"{make_header('🐙 استيراد مشروع من GitHub')}\n\n"
+        "أرسل رابط المستودع العام الآن (مثال: <code>https://github.com/user/repo</code> أو <code>user/repo</code>).\n\n"
+        "⚡ سيتم سحب الكود واكتشاف Python أو Node.js والمكتبات والتوكن تلقائياً.",
+        call.message.chat.id, call.message.message_id, reply_markup=m, parse_mode="HTML"
+    )
+
+@bot.message_handler(func=lambda m: not (m.text or "").startswith("/") and user_states.get(m.from_user.id) == "waiting_github_repo")
+def do_github_clone(msg):
+    uid = msg.from_user.id
+    user_states.pop(uid, None)
+    repo = (msg.text or "").strip()
+    if not repo.startswith("http"):
+        repo = f"https://github.com/{repo.lstrip('/')}"
+    if not repo.startswith("https://github.com/"):
+        return bot.reply_to(msg, "❌ يرجى إرسال رابط GitHub صحيح.")
+    name = re.sub(r"[^A-Za-z0-9_.-]", "_", repo.rstrip("/").split("/")[-1].replace(".git", ""))[:30] or "github_proj"
+    pdir = os.path.join(PROJECTS_DIR, f"{uid}_{name}_{secrets.token_hex(2)}")
+    wait = bot.reply_to(msg, "🐙 جاري سحب المستودع عبر <code>git clone</code>...", parse_mode="HTML")
+    try:
+        res = subprocess.run(["git", "clone", "--depth", "1", repo, pdir], capture_output=True, text=True, timeout=90)
+        if res.returncode != 0:
+            shutil.rmtree(pdir, ignore_errors=True)
+            return bot.edit_message_text(f"❌ فشل الاستنساخ:\n<pre>{html.escape(res.stderr[:400])}</pre>", msg.chat.id, wait.message_id, parse_mode="HTML")
+        ptype, entry = detect_entry_and_type(pdir)
+        if not entry:
+            shutil.rmtree(pdir, ignore_errors=True)
+            return bot.edit_message_text("❌ لم يتم العثور على ملف تشغيل (.py أو .js) في المستودع.", msg.chat.id, wait.message_id)
+        pid = add_project(uid, name, ptype, pdir, entry)
+        add_project_file(pid, entry)
+        info = extract_bot_info_project(pdir)
+        if info.get("token"):
+            update_project(pid, bot_token=info["token"], bot_username=info.get("username") or "", bot_name=info.get("name") or "")
+        trusted = is_trusted_user(uid)
+        set_project_approved(pid, 1 if trusted else 0)
+        if not trusted:
+            notify_admins_project_approval(pid, uid, msg.from_user, os.path.join(pdir, entry))
+        m = types.InlineKeyboardMarkup(row_width=1)
+        m.add(btn_green("▶️ فتح لوحة المشروع", f"proj_{pid}"))
+        bot.edit_message_text(
+            f"✅ <b>تم استيراد المشروع من GitHub!</b>\n\n"
+            f"📦 الاسم: <code>{name}</code>\n"
+            f"🏷️ النوع: {type_label(ptype)}\n"
+            f"📄 الملف الرئيسي: <code>{entry}</code>\n"
+            + ("⏳ بانتظار موافقة المطور للتشغيل." if not trusted else "🚀 جاهز للتشغيل الفوري!"),
+            msg.chat.id, wait.message_id, reply_markup=m, parse_mode="HTML"
+        )
+    except Exception as e:
+        shutil.rmtree(pdir, ignore_errors=True)
+        bot.edit_message_text(f"❌ خطأ: <code>{html.escape(str(e)[:250])}</code>", msg.chat.id, wait.message_id, parse_mode="HTML")
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith(("sess_save_", "sess_reset_")))
+def cb_session_manage(call):
+    uid = call.from_user.id
+    is_reset = call.data.startswith("sess_reset_")
+    pid = int(call.data.split("_")[-1])
+    p = get_project(pid)
+    if not p or not can_access_project(p, uid):
+        return bot.answer_callback_query(call.id, "🚫 غير مصرح", show_alert=True)
+    if not is_reset:
+        zpath = os.path.join(SESSIONS_BACKUP_DIR, f"sess_{pid}.zip")
+        cnt = 0
+        with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as zf:
+            for root, dirs, files in os.walk(p[4]):
+                dirs[:] = [d for d in dirs if d not in (".venv", "node_modules", ".git")]
+                for fn in files:
+                    if any(k in fn.lower() or k in root.lower() for k in ("session", "auth", "creds.json", ".wwebjs")):
+                        if fn not in ("package.json", "package-lock.json"):
+                            full = os.path.join(root, fn)
+                            zf.write(full, os.path.relpath(full, p[4]))
+                            cnt += 1
+        if cnt == 0:
+            return bot.answer_callback_query(call.id, "⚠️ لم يتم العثور على ملفات جلسة", show_alert=True)
+        bot.answer_callback_query(call.id, f"💾 تم حفظ {cnt} ملف جلسة!")
+        with open(zpath, "rb") as f:
+            bot.send_document(call.message.chat.id, f, caption=f"💾 نسخة جلسة {p[2]}", visible_file_name=f"{p[2]}_session.zip")
+    else:
+        stop_project(pid)
+        removed = 0
+        for root, dirs, files in os.walk(p[4]):
+            for d in list(dirs):
+                if any(k in d.lower() for k in ("auth_info", "session", ".wwebjs")):
+                    shutil.rmtree(os.path.join(root, d), ignore_errors=True)
+                    removed += 1
+            for fn in files:
+                if fn.endswith((".session", ".session-journal")) or fn == "creds.json":
+                    try:
+                        os.remove(os.path.join(root, fn))
+                        removed += 1
+                    except Exception:
+                        pass
+        bot.answer_callback_query(call.id, f"🔄 تم إعادة تعيين الجلسة ({removed} عنصر)", show_alert=True)
+
+@bot.callback_query_handler(func=lambda c: c.data == "server_monitor")
+def cb_server_monitor(call):
+    sm = get_server_metrics()
+    projs = get_all_projects()
+    running_cnt = sum(1 for pr in projs if is_running(pr[0]))
+    txt = (
+        f"{make_header('📊 مراقبة السيرفر الحية')}\n\n"
+        f"🧠 <b>المعالج (CPU):</b> <code>{sm['cpu']}%</code>\n"
+        f"💾 <b>الذاكرة (RAM):</b> <code>{sm['ram_used']} / {sm['ram_total']} GB ({sm['ram_pct']}%)</code>\n"
+        f"💿 <b>القرص (Disk):</b> <code>{sm['disk_used']} / {sm['disk_total']} GB ({sm['disk_pct']}%)</code>\n"
+        f"🟢 <b>المشاريع النشطة:</b> <code>{running_cnt} / {len(projs)}</code>\n"
+        f"⏱️ <b>مدة التشغيل:</b> <code>{calc_uptime(START_TIME.strftime('%Y-%m-%d %H:%M:%S'))}</code>\n"
+        f"🌐 <b>الرابط العام:</b> <code>{get_public_url()}</code>"
+    )
+    m = types.InlineKeyboardMarkup()
+    m.row(btn_blue("🔄 تحديث", "server_monitor"), btn_gray("🔙 رجوع", "main_menu"))
+    try:
+        bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=m, parse_mode="HTML")
+    except Exception:
+        bot.send_message(call.message.chat.id, txt, reply_markup=m, parse_mode="HTML")
+
 # ============================================================
 # Flask + Web Dashboard
 # ============================================================
@@ -6316,6 +6733,15 @@ def health():
         return "", 200
     return "OK", 200
 
+
+
+@web.route('/api/server_stats')
+def api_server_stats():
+    sm = get_server_metrics()
+    projs = get_all_projects()
+    sm["running"] = sum(1 for pr in projs if is_running(pr[0]))
+    sm["total"] = len(projs)
+    return jsonify(sm), 200
 
 @web.route('/status', methods=['GET'])
 def web_status():
@@ -7482,6 +7908,7 @@ if __name__ == "__main__":
 
     boot_recover()
     threading.Thread(target=cloud_backup_loop, daemon=True).start()
+    threading.Thread(target=local_24h_backup_loop, daemon=True).start()
     print("[*] Cloud backup OK")
     threading.Thread(target=keep_alive, daemon=True).start()
     print("[*] Heartbeat OK")
