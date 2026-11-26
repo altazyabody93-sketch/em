@@ -7886,6 +7886,728 @@ def run_web():
 # ============================================================
 # نقطة البداية
 # ============================================================
+# ============================================================
+# إصلاحات وتحسينات (مدمجة) — صناديق، حماية موارد، إعادة تشغيل تلقائي، دليل الأدمن
+# ============================================================
+_PATCH_SRC = r'''# -*- coding: utf-8 -*-
+"""
+weo_patch.py — إصلاحات وتحسينات لـ weo.py (HOST BOT v12)
+
+طريقة التركيب (سطرين فقط): ضعهما في weo.py مباشرة قبل السطر
+    if __name__ == "__main__":
+-------------------------------------------------------------
+import weo_patch
+weo_patch.install(globals())
+-------------------------------------------------------------
+ضع الملفين في نفس المجلد. لا يغيّر أي شيء من ملفك الأصلي، ويمكن إلغاؤه بحذف السطرين.
+"""
+import os
+import re
+import sys
+import json
+import time
+import html
+import threading
+import subprocess
+
+try:
+    import resource
+except Exception:          # ويندوز
+    resource = None
+try:
+    import psutil
+except Exception:
+    psutil = None
+
+
+def _env_int(name, default):
+    try:
+        return int(float(os.environ.get(name, default)))
+    except Exception:
+        return default
+
+
+# ------------------------------------------------------------
+# إعدادات الحماية (تُغيَّر من متغيرات البيئة)
+# ------------------------------------------------------------
+MAX_RAM_MB = _env_int("PROJECT_MAX_RAM_MB", 512)        # حد الرام لكل مشروع
+MAX_CPU_PCT = _env_int("PROJECT_MAX_CPU_PCT", 95)       # حد المعالج المستمر
+CPU_STRIKES = _env_int("PROJECT_CPU_STRIKES", 6)        # عدد الفحوص (كل 15ث) قبل الإيقاف
+MAX_FILE_MB = _env_int("PROJECT_MAX_FILE_MB", 200)      # أكبر ملف يكتبه المشروع
+STRICT_AS_MB = _env_int("PROJECT_STRICT_AS_MB", 0)      # اختياري: حد ذاكرة افتراضية (بايثون فقط)
+HOST_RAM_DANGER = _env_int("HOST_RAM_DANGER_PCT", 93)   # ضغط السيرفر الذي يوقف أثقل مشروع
+MAX_AUTO_RESTARTS = 3
+CRASH_WINDOW = 600
+
+ORIG_LINE = "━" * 25
+SHORT_LINE = "━" * 14
+
+_NS = {}
+_TL = threading.local()
+
+
+# ============================================================
+# 1) إصلاح النصوص المكسورة (عناوين RTL + \n الحرفية) وتحويلها لصناديق
+# ============================================================
+_HDR_RX = re.compile(r"━{8,}[ \t]*\n[ \t]*(<b>[^\n]*?</b>)[ \t]*\n[ \t]*━{8,}[ \t]*")
+_LINE_RX = re.compile(r"━{8,}")
+_PROTECT_RX = re.compile(r"(<pre.*?</pre>|<code>.*?</code>|<blockquote.*?</blockquote>)", re.S)
+
+
+def _divider():
+    """الخط الفاصل: قصير افتراضياً (لا ينكسر في RTL)، أو ما اختاره الأدمن."""
+    try:
+        custom = _NS["get_ui"]("divider_line")
+        if custom and custom != ORIG_LINE:
+            return custom
+    except Exception:
+        pass
+    return SHORT_LINE
+
+
+def beautify(text, html_mode=True):
+    """يحوّل (خط ━ + عنوان + خط ━) إلى صندوق blockquote، ويقصّر الخطوط المنفردة."""
+    if not isinstance(text, str) or "━" not in text and "\\n" not in text:
+        return text
+    if html_mode:
+        text = _HDR_RX.sub(lambda m: "<blockquote>" + m.group(1) + "</blockquote>", text)
+        parts = _PROTECT_RX.split(text)
+        for i in range(0, len(parts), 2):          # الأجزاء خارج code/pre/blockquote فقط
+            seg = parts[i].replace("\\n", "\n")
+            parts[i] = _LINE_RX.sub(_divider(), seg)
+        return "".join(parts)
+    return _LINE_RX.sub(_divider(), text)
+
+
+def _bar(pct, width=12):
+    try:
+        pct = max(0.0, min(100.0, float(pct)))
+    except Exception:
+        pct = 0.0
+    filled = int(round(width * pct / 100.0))
+    return "▰" * filled + "▱" * (width - filled)
+
+
+# ============================================================
+# 2) صناديق التثبيت / التشغيل (Progress)
+# ============================================================
+def make_header(title):
+    return "<blockquote><b>" + str(title) + "</b></blockquote>"
+
+
+def render_progress(title, icon_done, icon_fail, items, footer=""):
+    done = sum(1 for _, ok in items if ok)
+    total = len(items)
+    pct = int(100 * done / max(total, 1))
+    lines = [f"{icon_done if ok else icon_fail} {name}" for name, ok in items]
+    shown = lines[-30:]
+    more = f"… +{len(lines) - 30} أقدم\n" if len(lines) > 30 else ""
+    tag = "blockquote expandable" if len(shown) > 10 else "blockquote"
+    out = (
+        f"<blockquote><b>{title}</b></blockquote>\n"
+        f"<blockquote>{_bar(pct)}  <b>{pct}%</b>  ·  <code>{done}/{total}</code></blockquote>"
+    )
+    if shown:
+        out += f"\n<{tag}>{more}" + "\n".join(shown) + "</" + tag.split()[0] + ">"
+    if footer:
+        out += f"\n{footer}"
+    return out
+
+
+def render_start_card(pid, name=""):
+    ns = _NS
+    d = ns["_START_PROGRESS"].get(pid, {})
+    phase = d.get("phase", "check")
+    steps = [("check", "🔍 فحص الملفات"), ("install", "📦 تجهيز البيئة والمكتبات"),
+             ("launch", "▶️ إطلاق المشروع"), ("watch", "👁 مراقبة الاستقرار")]
+    order = [k for k, _ in steps]
+    idx = order.index(phase) if phase in order else 0
+    base = {0: 5, 1: 30, 2: 60}.get(idx, 75)
+    if phase == "watch":
+        total = max(int(d.get("watch_total", ns.get("START_WATCH_SECONDS", 20))), 1)
+        done = min(int(time.time() - d.get("watch_t0", time.time())), total)
+        pct = 75 + int(25 * done / total)
+    else:
+        pct = base
+    lines = []
+    for i, (_, label) in enumerate(steps):
+        mark = "✅" if i < idx else ("⏳" if i == idx else "▫️")
+        lines.append(f"{mark} {label}")
+    name_line = ("📦 <b>" + html.escape(str(name)) + "</b>\n") if name else ""
+    out = (
+        "<blockquote><b>🚀 جاري تشغيل المشروع</b></blockquote>\n"
+        f"<blockquote>{name_line}{_bar(pct)}  <b>{pct}%</b></blockquote>\n"
+        "<blockquote>" + "\n".join(lines) + "</blockquote>"
+    )
+    notes = d.get("notes", [])[-6:]
+    if notes:
+        out += "\n<blockquote expandable>" + "\n".join(notes) + "</blockquote>"
+    return out
+
+
+# ============================================================
+# 3) مراقبة السيرفر (صندوق + أشرطة)
+# ============================================================
+def _server_monitor(call):
+    ns = _NS
+    bot, types = ns["bot"], ns["types"]
+    uid = call.from_user.id
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+    sm = ns["get_server_metrics"]()
+    projs = ns["get_all_projects"]() if ns["is_admin"](uid) else ns["get_projects_by_owner"](uid)
+    run = [p for p in projs if ns["is_running"](p[0])]
+    up = ns["calc_uptime"](ns["START_TIME"].strftime("%Y-%m-%d %H:%M:%S"))
+    box = (
+        f"🧠 <b>المعالج</b>  <code>{sm['cpu']}%</code>\n{_bar(sm['cpu'])}\n\n"
+        f"💾 <b>الذاكرة</b>  <code>{sm['ram_used']}/{sm['ram_total']} GB</code> · <code>{sm['ram_pct']}%</code>\n{_bar(sm['ram_pct'])}\n\n"
+        f"💿 <b>القرص</b>  <code>{sm['disk_used']}/{sm['disk_total']} GB</code> · <code>{sm['disk_pct']}%</code>\n{_bar(sm['disk_pct'])}"
+    )
+    txt = (
+        "<blockquote><b>📊 مراقبة السيرفر الحية</b></blockquote>\n"
+        f"<blockquote>{box}</blockquote>\n"
+        f"<blockquote>🟢 النشطة: <code>{len(run)}/{len(projs)}</code>\n⏱ التشغيل: <code>{up}</code></blockquote>"
+    )
+    if run:
+        lines = []
+        for p in run[:8]:
+            cpu, mem = ns["get_proc_metrics"](p[14])
+            lines.append(f"• <b>{html.escape(p[2])}</b> — RAM <code>{mem} MB</code> · CPU <code>{cpu}%</code>")
+        txt += "\n<blockquote expandable>" + "\n".join(lines) + "</blockquote>"
+    txt += f"\n<i>🛡 حد كل مشروع: {MAX_RAM_MB}MB رام</i>"
+    m = types.InlineKeyboardMarkup()
+    m.row(ns["btn_blue"]("🔄 تحديث", "server_monitor"), ns["btn_gray"]("🔙 رجوع", "main_menu"))
+    try:
+        bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=m, parse_mode="HTML")
+    except Exception as e:
+        if "not modified" not in str(e).lower():
+            bot.send_message(call.message.chat.id, txt, reply_markup=m, parse_mode="HTML")
+
+
+# ============================================================
+# 4) دليل الأدمن
+# ============================================================
+def _guide_text():
+    return (
+        "<blockquote><b>📖 دليل الأدمن — خطوة بخطوة</b></blockquote>\n"
+        "<blockquote><b>🎨 تخصيص الأزرار والنصوص</b>\n"
+        "لوحة المطور ← 🎨 تخصيص البوت ← 🎛 الأزرار أو 📝 النصوص ← اختر الشاشة ← اختر العنصر.\n"
+        "تظهر معاينة قبل الحفظ، وفي كل شاشة زر 🔙 رجوع.</blockquote>\n"
+        "<blockquote><b>🎯 التخصيص المباشر (الأسهل)</b>\n"
+        "اضغط 🎯 التخصيص المباشر أو أرسل /edit، ثم تنقّل كمستخدم واضغط أي زر فيظهر محرره فوراً. "
+        "أرسل /edit مرة ثانية للإنهاء.</blockquote>\n"
+        "<blockquote><b>✅ الموافقات</b>\n"
+        "كل ملف جديد يصلك مع زرّي قبول/رفض. الأعضاء في «✅ مستخدمين بدون موافقة» يعملون مباشرة.</blockquote>\n"
+        "<blockquote><b>🛡 حماية الموارد</b>\n"
+        f"كل مشروع: رام <code>{MAX_RAM_MB}MB</code> (VIP ×2) ومعالج <code>{MAX_CPU_PCT}%</code>. "
+        "عند التجاوز يُوقَف تلقائياً ويصلك إشعار. تُغيَّر بمتغيرات PROJECT_MAX_RAM_MB و PROJECT_MAX_CPU_PCT.</blockquote>\n"
+        "<blockquote><b>🔁 الاستقرار</b>\n"
+        "انهيار مشروع ← إعادة تشغيل تلقائية حتى 3 مرات. وبعد إعادة تشغيل الاستضافة تعود المشاريع الشغّالة وحدها.</blockquote>\n"
+        "<blockquote><b>💾 النسخ الاحتياطي</b>\n"
+        "نسخة سحابية مثبتة في محادثتك (☁️ نسخ سحابي الآن) + ZIP محلي كل 24 ساعة.</blockquote>\n"
+        "<blockquote><b>📊 المراقبة</b>\n"
+        "زر «📊 حالة السيرفر» في القائمة الرئيسية يعرض المعالج والذاكرة والقرص ومشاريعك الأثقل.</blockquote>"
+    )
+
+
+def _guide_cb(call):
+    ns = _NS
+    if not ns["is_admin"](call.from_user.id):
+        return
+    try:
+        ns["bot"].answer_callback_query(call.id)
+    except Exception:
+        pass
+    m = ns["types"].InlineKeyboardMarkup()
+    m.add(ns["btn_gray"]("🔙 رجوع", "admin_panel"))
+    try:
+        ns["bot"].edit_message_text(_guide_text(), call.message.chat.id, call.message.message_id,
+                                    reply_markup=m, parse_mode="HTML")
+    except Exception:
+        ns["bot"].send_message(call.message.chat.id, _guide_text(), reply_markup=m, parse_mode="HTML")
+
+
+def _guide_cmd(msg):
+    ns = _NS
+    if not ns["is_admin"](msg.from_user.id):
+        return
+    m = ns["types"].InlineKeyboardMarkup()
+    m.add(ns["btn_gray"]("🔙 لوحة المطور", "admin_panel"))
+    ns["bot"].send_message(msg.chat.id, _guide_text(), reply_markup=m, parse_mode="HTML")
+
+
+# ============================================================
+# 5) تنظيف لوحات الأزرار: حذف المكرر + إضافة زر الدليل
+# ============================================================
+def _fix_markup(k):
+    rm = k.get("reply_markup")
+    if rm is None or not hasattr(rm, "keyboard"):
+        return
+    try:
+        seen, rows = set(), []
+        for row in rm.keyboard:
+            nr = []
+            for b in row:
+                cb = getattr(b, "callback_data", None)
+                if cb and cb != "noop":
+                    if cb in seen:
+                        continue
+                    seen.add(cb)
+                nr.append(b)
+            if nr:
+                rows.append(nr)
+        if "admin_toggle_pause" in seen and "adm_guide" not in seen:
+            rows.append([_NS["btn_green"]("📖 دليل الأدمن (علّمني)", "adm_guide")])
+        rm.keyboard = rows
+    except Exception as e:
+        print(f"[Patch] fix_markup: {e}")
+
+
+# ============================================================
+# 6) حماية الموارد + إعادة التشغيل عند الانهيار + استعادة الحالة
+# ============================================================
+_CRASHED = {}
+_MANUAL = set()
+_HIST = {}
+_cpu_last = {}
+_strikes = {}
+
+
+def _notify(uids, text):
+    ns = _NS
+    for u in set(uids):
+        try:
+            ns["bot"].send_message(u, text, parse_mode="HTML")
+        except Exception:
+            pass
+
+
+def _tree(pid_os):
+    root = psutil.Process(pid_os)
+    return [root] + root.children(recursive=True)
+
+
+def _tree_usage(pid_os):
+    procs, rss, secs = _tree(pid_os), 0, 0.0
+    for p in procs:
+        try:
+            rss += p.memory_info().rss
+            t = p.cpu_times()
+            secs += t.user + t.system
+        except Exception:
+            pass
+    return rss / (1024 * 1024), secs
+
+
+def _limit_ram(pid, owner):
+    ns = _NS
+    try:
+        custom = int(float(ns["get_ui"](f"limit_ram_{pid}") or 0))
+        if custom > 0:
+            return custom
+    except Exception:
+        pass
+    mult = 2 if ns["is_premium"](owner) else 1
+    return MAX_RAM_MB * mult
+
+
+def _kill_for_limit(pid, p, reason):
+    ns = _NS
+    try:
+        ns["stop_project"](pid)
+        ns["log_action"](0, "resource_limit", f"pid={pid} {reason}")
+    except Exception as e:
+        print(f"[Guard] {e}")
+    msg = (f"<blockquote><b>🛡 إيقاف تلقائي لمشروع</b></blockquote>\n"
+           f"<blockquote>📦 <b>{html.escape(p[2])}</b> (ID: <code>{pid}</code>)\n"
+           f"👤 المالك: <code>{p[1]}</code>\n⚠️ السبب: {reason}</blockquote>")
+    _notify(list(ns["ADMIN_IDS"]) + [p[1]], msg)
+
+
+def _guard_loop():
+    ns = _NS
+    RUNNING = ns["RUNNING"]
+    last_host = 0.0
+    while True:
+        time.sleep(15)
+        if not psutil:
+            continue
+        usage = {}
+        try:
+            for key, proc in list(RUNNING.items()):
+                try:
+                    pid = int(key[1:])
+                except Exception:
+                    continue
+                if proc.poll() is not None:
+                    continue
+                p = ns["get_project"](pid)
+                if not p or ns["is_admin"](p[1]):
+                    continue
+                try:
+                    rss, secs = _tree_usage(proc.pid)
+                except Exception:
+                    continue
+                usage[pid] = (rss, p)
+                now = time.time()
+                prev = _cpu_last.get(pid)
+                _cpu_last[pid] = (now, secs)
+                limit = _limit_ram(pid, p[1])
+                if rss > limit:
+                    _kill_for_limit(pid, p, f"تجاوز الذاكرة: <code>{rss:.0f}MB</code> من <code>{limit}MB</code>")
+                    continue
+                if prev and now > prev[0]:
+                    cpu = (secs - prev[1]) / (now - prev[0]) * 100.0
+                    if cpu > MAX_CPU_PCT:
+                        _strikes[pid] = _strikes.get(pid, 0) + 1
+                    else:
+                        _strikes[pid] = 0
+                    if _strikes.get(pid, 0) >= CPU_STRIKES:
+                        _strikes[pid] = 0
+                        _kill_for_limit(pid, p, f"استهلاك معالج مستمر: <code>{cpu:.0f}%</code>")
+            # حماية السيرفر نفسه: إذا قارب الرام على النفاد نوقف أثقل مشروع
+            vm = psutil.virtual_memory()
+            if vm.percent >= HOST_RAM_DANGER and usage and time.time() - last_host > 60:
+                last_host = time.time()
+                pid = max(usage, key=lambda x: usage[x][0])
+                _kill_for_limit(pid, usage[pid][1], f"ضغط على ذاكرة السيرفر (<code>{vm.percent}%</code>)")
+        except Exception as e:
+            print(f"[Guard] {e}")
+
+
+def _crash_guard():
+    ns = _NS
+    RUNNING = ns["RUNNING"]
+    while True:
+        time.sleep(10)
+        for pid in list(_CRASHED):
+            rc = _CRASHED.pop(pid, None)
+            try:
+                p = ns["get_project"](pid)
+                if not p or pid in _MANUAL or ns["get_project_approved"](pid) != 1:
+                    continue
+                live = RUNNING.get(f"p{pid}")
+                if live is not None and live.poll() is None:
+                    continue
+                if p[3] == "script" or rc == 0:          # انتهى طبيعياً
+                    continue
+                now = time.time()
+                hist = [t for t in _HIST.get(pid, []) if now - t < CRASH_WINDOW]
+                if len(hist) >= MAX_AUTO_RESTARTS:
+                    ns["update_project"](pid, status="crashed")
+                    _notify([p[1]] + list(ns["ADMIN_IDS"]),
+                            f"<blockquote><b>🚫 توقف نهائي</b></blockquote>\n"
+                            f"<blockquote>📦 <b>{html.escape(p[2])}</b> انهار {MAX_AUTO_RESTARTS} مرات خلال دقائق. "
+                            "راجع السجلات ثم شغّله يدوياً.</blockquote>")
+                    _HIST.pop(pid, None)
+                    continue
+                hist.append(now)
+                _HIST[pid] = hist
+                ok, _, _ = ns["start_project"](pid, watch=8)
+                _notify([p[1]],
+                        f"<blockquote><b>🔁 إعادة تشغيل تلقائية</b></blockquote>\n"
+                        f"<blockquote>📦 <b>{html.escape(p[2])}</b> انهار وأُعيد تشغيله "
+                        f"({len(hist)}/{MAX_AUTO_RESTARTS}) {'✅' if ok else '❌'}</blockquote>")
+            except Exception as e:
+                print(f"[CrashGuard] {e}")
+
+
+class _Adopted:
+    """يتبنّى عملية مشروع كانت شغّالة قبل إعادة تشغيل الاستضافة (بدون إيقافها)."""
+    def __init__(self, pid):
+        self.pid = pid
+        self._p = psutil.Process(pid)
+
+    def poll(self):
+        try:
+            if self._p.is_running() and self._p.status() != psutil.STATUS_ZOMBIE:
+                return None
+        except Exception:
+            pass
+        return 1
+
+    def wait(self, timeout=None):
+        try:
+            self._p.wait(timeout)
+        except Exception:
+            pass
+        return 1
+
+    def terminate(self):
+        try:
+            self._p.terminate()
+        except Exception:
+            pass
+
+    def kill(self):
+        try:
+            self._p.kill()
+        except Exception:
+            pass
+
+
+def _alive_pid(p):
+    if not (psutil and p[14]):
+        return None
+    try:
+        ps = psutil.Process(int(p[14]))
+        if not ps.is_running() or ps.status() == psutil.STATUS_ZOMBIE:
+            return None
+        cwd, root = os.path.realpath(ps.cwd()), os.path.realpath(p[4])
+        if cwd == root or cwd.startswith(root + os.sep):
+            return ps.pid
+    except Exception:
+        pass
+    return None
+
+
+def _state_file():
+    return os.path.join(_NS["DATA_DIR"], "projects_state.json")
+
+
+def _snapshot_loop():
+    ns = _NS
+    while True:
+        time.sleep(300)
+        try:
+            ids = [p[0] for p in ns["get_all_projects"]() if ns["is_running"](p[0])]
+            with open(_state_file(), "w", encoding="utf-8") as f:
+                json.dump({"running": ids, "ts": time.strftime("%Y-%m-%d %H:%M:%S")}, f)
+        except Exception as e:
+            print(f"[Snapshot] {e}")
+
+
+def _boot_restore():
+    ns = _NS
+    time.sleep(20)                      # بعد boot_recover واستعادة القاعدة
+    try:
+        ids = {p[0] for p in ns["get_all_projects"]() if p[15] == "running"}
+        try:
+            with open(_state_file(), "r", encoding="utf-8") as f:
+                ids |= set(json.load(f).get("running", []))
+        except Exception:
+            pass
+        restored = []
+        for pid in sorted(ids):
+            p = ns["get_project"](pid)
+            if not p or ns["get_project_approved"](pid) != 1:
+                continue
+            live = ns["RUNNING"].get(f"p{pid}")
+            if live is not None and live.poll() is None:
+                continue
+            alive = _alive_pid(p)
+            if alive:
+                ns["RUNNING"][f"p{pid}"] = _Adopted(alive)       # تبنّي بدون انقطاع
+                restored.append(p[2])
+                continue
+            ok, _, _ = ns["start_project"](pid, watch=8)
+            if ok:
+                restored.append(p[2])
+            time.sleep(3)
+        if restored:
+            _notify(ns["ADMIN_IDS"],
+                    "<blockquote><b>♻️ استعادة الحالة بعد الإقلاع</b></blockquote>\n"
+                    "<blockquote>" + "\n".join("✅ " + html.escape(n) for n in restored[:25]) + "</blockquote>")
+    except Exception as e:
+        print(f"[BootRestore] {e}")
+
+
+def _backup_loop():
+    """نسخ ZIP محلي كل 24 ساعة فعلياً (حتى لو أُعيد تشغيل السيرفر قبلها)."""
+    ns = _NS
+    time.sleep(600)
+    while True:
+        try:
+            d = ns["BACKUPS_24H_DIR"]
+            files = [os.path.join(d, x) for x in os.listdir(d) if x.endswith(".zip")]
+            newest = max((os.path.getmtime(f) for f in files), default=0)
+            if time.time() - newest > 24 * 3600:
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                dest = os.path.join(d, f"auto_24h_{ts}.zip")
+                ns["zip_project_dir"](ns["PROJECTS_DIR"], dest, exclude_dirnames=tuple(ns["_BK_EXCL_DIRS"]))
+                files = sorted(os.path.join(d, x) for x in os.listdir(d) if x.endswith(".zip"))
+                for old in files[:-5]:
+                    try:
+                        os.remove(old)
+                    except Exception:
+                        pass
+                ns["log_action"](0, "auto_backup_24h", os.path.basename(dest))
+        except Exception as e:
+            print(f"[Backup24h] {e}")
+        time.sleep(1800)
+
+
+# ============================================================
+# 7) نقطة التركيب
+# ============================================================
+def install(ns):
+    global _NS
+    _NS = ns
+    bot = ns["bot"]
+    types = ns["types"]
+
+    # --- (أ) إصلاح uptime: الكود كان يستخدم p[16]=created_at بدل p[17]=last_start
+    def _swap(row):
+        if row is None or len(row) < 18:
+            return row
+        r = list(row)
+        r[16], r[17] = r[17], r[16]
+        return tuple(r)
+
+    _og_p, _og_all, _og_owner = ns["get_project"], ns["get_all_projects"], ns["get_projects_by_owner"]
+    ns["get_project"] = lambda pid: _swap(_og_p(pid))
+    ns["get_all_projects"] = lambda: [_swap(r) for r in _og_all()]
+    ns["get_projects_by_owner"] = lambda uid: [_swap(r) for r in _og_owner(uid)]
+
+    # --- (ب) رابط لوحة الويب: لا يُلغى كل مرة تفتح فيها القائمة
+    _og_token = ns["create_dashboard_token"]
+
+    def create_dashboard_token(uid):
+        try:
+            with ns["DB_LOCK"]:
+                conn = ns["_conn"]()
+                r = conn.execute("SELECT token FROM dashboard_tokens WHERE user_id=?", (uid,)).fetchone()
+                conn.close()
+            if r:
+                return r[0]
+        except Exception:
+            pass
+        return _og_token(uid)
+    ns["create_dashboard_token"] = create_dashboard_token
+
+    # --- (ج) تتبّع الانهيار مقابل الإيقاف اليدوي
+    _og_running, _og_stop = ns["is_running"], ns["stop_project"]
+    RUNNING = ns["RUNNING"]
+
+    def is_running(pid):
+        proc = RUNNING.get(f"p{pid}")
+        if proc is not None:
+            rc = proc.poll()
+            if rc is not None and pid not in _MANUAL:
+                _CRASHED[pid] = rc
+        return _og_running(pid)
+
+    def stop_project(pid):
+        _MANUAL.add(pid)
+        try:
+            return _og_stop(pid)
+        finally:
+            _CRASHED.pop(pid, None)
+            _MANUAL.discard(pid)
+    ns["is_running"], ns["stop_project"] = is_running, stop_project
+
+    # --- (د) حدود النظام للمشاريع عبر resource (تُطبَّق قبل exec في العملية الابنة)
+    if resource and os.name != "nt":
+        proj_root = ns["PROJECTS_DIR"]
+        _Base = subprocess.Popen
+
+        class _LimitedPopen(_Base):
+            def __init__(self, *a, **k):
+                cwd = str(k.get("cwd") or "")
+                base = k.get("preexec_fn")
+                if base and cwd.startswith(proj_root):
+                    def pre():
+                        base()
+                        try:
+                            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+                            fs = MAX_FILE_MB * 1024 * 1024
+                            resource.setrlimit(resource.RLIMIT_FSIZE, (fs, fs))
+                            if STRICT_AS_MB > 0:
+                                lim = STRICT_AS_MB * 1024 * 1024
+                                resource.setrlimit(resource.RLIMIT_AS, (lim, lim))
+                        except Exception:
+                            pass
+                    k["preexec_fn"] = pre
+                super().__init__(*a, **k)
+        subprocess.Popen = _LimitedPopen
+
+    # --- (هـ) نصوص آمنة: القوالب لا تكسر الإرسال، والعناوين تتحوّل لصناديق
+    _og_tpl = ns["apply_templates"]
+
+    def apply_templates(text):
+        try:
+            return _og_tpl(text)
+        except Exception as e:
+            print(f"[Patch] template: {e}")
+            return text
+
+    def apply_divider(text):
+        if not isinstance(text, str):
+            return text
+        try:
+            return beautify(text, html_mode=getattr(_TL, "html", False))
+        except Exception:
+            return text
+    ns["apply_templates"], ns["apply_divider"] = apply_templates, apply_divider
+    ns["make_header"] = make_header
+    ns["render_progress"] = render_progress
+    ns["render_start_card"] = render_start_card
+
+    _og_send, _og_edit, _og_reply = bot.send_message, bot.edit_message_text, bot.reply_to
+
+    def _is_html(k):
+        return (k.get("parse_mode") or getattr(bot, "parse_mode", None)) == "HTML"
+
+    def send_message(chat_id, text, *a, **k):
+        _TL.html = _is_html(k)
+        _fix_markup(k)
+        return _og_send(chat_id, text, *a, **k)
+
+    def edit_message_text(text, *a, **k):
+        _TL.html = _is_html(k)
+        _fix_markup(k)
+        return _og_edit(text, *a, **k)
+
+    def reply_to(message, text, *a, **k):
+        _TL.html = _is_html(k)
+        _fix_markup(k)
+        return _og_reply(message, text, *a, **k)
+    bot.send_message, bot.edit_message_text, bot.reply_to = send_message, edit_message_text, reply_to
+
+    # --- (و) شاشة مراقبة السيرفر الجديدة + دليل الأدمن
+    old = ns.get("cb_server_monitor")
+    for h in bot.callback_query_handlers:
+        if old is not None and h.get("function") is old:
+            h["function"] = _server_monitor
+    bot.callback_query_handler(func=lambda c: c.data == "adm_guide")(_guide_cb)
+    bot.message_handler(commands=["guide"])(_guide_cmd)
+
+    # --- (ز) ثغرة XSS في سجلات لوحة الويب (كانت تعرض السجل كـ HTML خام)
+    try:
+        web, request = ns["web"], ns["request"]
+
+        def w_logs(pid):
+            token = request.args.get("token")
+            uid = ns["get_dashboard_user"](token)
+            if not uid:
+                return "🔒 غير مصرح", 403
+            p = ns["get_project"](pid)
+            if not p or not ns["can_access_project"](p, uid):
+                return "🚫 غير مصرح", 403
+            logs = html.escape(ns["get_logs"](pid, 200))
+            return ("<body style='background:#0f172a;color:#86efac;font-family:monospace;padding:20px'>"
+                    f"<pre style='white-space:pre-wrap'>{logs}</pre>"
+                    f"<a href='/?token={html.escape(token)}' style='color:#60a5fa'>رجوع</a></body>")
+        web.view_functions["w_logs"] = w_logs
+    except Exception as e:
+        print(f"[Patch] w_logs: {e}")
+
+    # --- (ح) الخيوط الخلفية
+    ns["local_24h_backup_loop"] = _backup_loop
+    if "--web-only" not in sys.argv and os.environ.get("WEB_ONLY") != "1":
+        for fn in (_guard_loop, _crash_guard, _snapshot_loop, _boot_restore):
+            threading.Thread(target=fn, daemon=True, name="patch_" + fn.__name__).start()
+
+    print("[Patch] ✅ weo_patch جاهز: صناديق · حماية موارد · إعادة تشغيل تلقائي · دليل الأدمن")
+'''
+
+import types as _types_mod
+weo_patch = _types_mod.ModuleType('weo_patch')
+exec(compile(_PATCH_SRC, 'weo_patch', 'exec'), weo_patch.__dict__)
+weo_patch.install(globals())
+
 if __name__ == "__main__":
     if "--web-only" in sys.argv or os.environ.get("WEB_ONLY") == "1":
         print("=" * 55)
