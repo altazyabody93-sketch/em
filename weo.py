@@ -7023,7 +7023,8 @@ def cb_admin(call):
     m.row(btn(f"{'▶️ تشغيل الاستضافة' if host_paused() else '⏸ إيقاف الاستضافة'}", "admin_toggle_pause",
              style="success" if host_paused() else "danger"))
     m.row(btn_green("🎯 التخصيص المباشر", "dx_toggle"), btn_blue("📤 سحب ملفات مستخدمين", "pull_0"))
-    m.row(btn_green("🩺 مراقبة المشاريع", "admin_mon_0"), btn_blue("📖 دليل الأدمن", "adm_guide"))
+    m.row(btn_green("🩺 مراقبة المشاريع", "admin_mon_0"), btn_green("👥 مشاريع المستخدمين", "admusr_0"))
+    m.row(btn_blue("📖 دليل الأدمن", "adm_guide"))
     m.add(btn_gray("🔙 رجوع", "main_menu"))
 
     try:
@@ -10878,6 +10879,281 @@ def _guide_cmd(msg_):
     m = types.InlineKeyboardMarkup()
     m.add(btn_gray("🔙 لوحة المطور", "admin_panel"))
     bot.send_message(msg_.chat.id, _guide_text(), reply_markup=m, parse_mode="HTML")
+
+
+_USR_PER_PAGE = 8
+
+
+def _user_display(uid):
+    u = get_user(uid)
+    name = (u[2] if u and len(u) > 2 and u[2] else "") or "بدون اسم"
+    return str(name)[:18]
+
+
+def _group_by_owner():
+    groups = {}
+    for p in get_all_projects():
+        groups.setdefault(p[1], []).append(p)
+    return groups
+
+
+def _icon_for(p):
+    pid = p[0]
+    if get_project_approved(pid) == 0:
+        return "⏳"
+    if get_project_approved(pid) == 2:
+        return "❌"
+    ic, _label = _monitor_row_state(p)
+    return ic
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("admusr_"))
+def cb_adm_users(call):
+    if not is_admin(call.from_user.id):
+        return
+    try:
+        page = int(call.data[len("admusr_"):] or 0)
+    except Exception:
+        page = 0
+    bot.answer_callback_query(call.id)
+    groups = _group_by_owner()
+    rows = []
+    for uid, projs in groups.items():
+        run = sum(1 for p in projs if is_running(p[0]))
+        rows.append((uid, len(projs), run))
+    rows.sort(key=lambda r: (-r[2], -r[1], r[0]))
+    pages = max(1, (len(rows) + _USR_PER_PAGE - 1) // _USR_PER_PAGE)
+    page = max(0, min(page, pages - 1))
+    total_p = sum(r[1] for r in rows)
+    total_r = sum(r[2] for r in rows)
+    m = types.InlineKeyboardMarkup(row_width=1)
+    for uid, n, run in rows[page * _USR_PER_PAGE:(page + 1) * _USR_PER_PAGE]:
+        m.add(btn_blue(f"👤 {_user_display(uid)} · {uid} · 🟢{run}/{n}", f"admusv_{uid}_0"))
+    nav = []
+    if page > 0:
+        nav.append(btn_blue("◀️", f"admusr_{page - 1}"))
+    if page < pages - 1:
+        nav.append(btn_blue("▶️", f"admusr_{page + 1}"))
+    if nav:
+        m.row(*nav)
+    m.row(btn_blue("🔎 بحث بالمعرّف", "admus_find"), btn_green("▶️ تشغيل كل المتوقفة", "admall_go"))
+    m.add(btn_gray("🔙 رجوع", "admin_panel"))
+    txt = (f"<b>👥 مشاريع المستخدمين</b>\n\n👤 مستخدمون لديهم مشاريع: <code>{len(rows)}</code>\n"
+           f"📦 المشاريع: <code>{total_p}</code> · 🟢 شغّال: <code>{total_r}</code>\n"
+           f"الصفحة {page + 1}/{pages}\n\nاختر مستخدماً لتشغيل/إيقاف/إدارة مشاريعه.")
+    _show(call, txt, m)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "admus_find")
+def cb_adm_find(call):
+    if not is_admin(call.from_user.id):
+        return
+    bot.answer_callback_query(call.id)
+    user_states[call.from_user.id] = "waiting_admusr_find"
+    m = types.InlineKeyboardMarkup()
+    m.add(btn_red("❌ إلغاء", "admusr_0"))
+    _show(call, "🔎 أرسل <b>معرّف المستخدم</b> (أرقام فقط).", m)
+
+
+@bot.message_handler(func=lambda m: user_states.get(m.from_user.id) == "waiting_admusr_find")
+def do_adm_find(msg_):
+    if not is_admin(msg_.from_user.id):
+        return
+    t = (msg_.text or "").strip()
+    user_states.pop(msg_.from_user.id, None)
+    if not t.lstrip("-").isdigit():
+        bot.reply_to(msg_, "❌ المعرّف أرقام فقط.")
+        return
+    uid = int(t)
+    if not get_projects_by_owner(uid):
+        m = types.InlineKeyboardMarkup()
+        m.add(btn_gray("🔙 رجوع", "admusr_0"))
+        bot.reply_to(msg_, "ℹ️ لا توجد مشاريع لهذا المستخدم.", reply_markup=m)
+        return
+    m = types.InlineKeyboardMarkup()
+    m.add(btn_green(f"📂 فتح مشاريع {uid}", f"admusv_{uid}_0"))
+    bot.reply_to(msg_, f"✅ وُجد المستخدم <code>{uid}</code>.", parse_mode="HTML", reply_markup=m)
+
+
+def _parse_uid_page(data, prefix):
+    rest = data[len(prefix):].split("_")
+    try:
+        return int(rest[0]), (int(rest[1]) if len(rest) > 1 else 0)
+    except Exception:
+        return None, 0
+
+
+def _render_user_view(call, uid, page=0):
+    projs = sorted(get_projects_by_owner(uid), key=lambda p: p[0])
+    pages = max(1, (len(projs) + _USR_PER_PAGE - 1) // _USR_PER_PAGE)
+    page = max(0, min(page, pages - 1))
+    run = sum(1 for p in projs if is_running(p[0]))
+    m = types.InlineKeyboardMarkup(row_width=3)
+    lines = []
+    for p in projs[page * _USR_PER_PAGE:(page + 1) * _USR_PER_PAGE]:
+        pid = p[0]
+        ic = _icon_for(p)
+        lines.append(f"{ic} <b>{esc(p[2])}</b> (#{pid}) · {type_label(p[3])}")
+        name = p[2][:12]
+        if get_project_approved(pid) != 1:
+            if get_project_approved(pid) == 0:
+                m.row(btn_green(f"✅ موافقة وتشغيل {name}", f"admua_{pid}_{uid}"), btn_blue("📂", f"proj_{pid}"))
+            else:
+                m.row(btn_blue(f"📂 {name} (مرفوض)", f"proj_{pid}"))
+        elif is_running(pid):
+            m.row(btn_red(f"⏹ {name}", f"admus_{pid}_{uid}"), btn_blue("🔁", f"admur_{pid}_{uid}"), btn_blue("📂", f"proj_{pid}"))
+        else:
+            m.row(btn_green(f"▶️ {name}", f"admug_{pid}_{uid}"), btn_blue("🧠", f"admdg_{pid}"), btn_blue("📂", f"proj_{pid}"))
+    nav = []
+    if page > 0:
+        nav.append(btn_blue("◀️", f"admusv_{uid}_{page - 1}"))
+    if page < pages - 1:
+        nav.append(btn_blue("▶️", f"admusv_{uid}_{page + 1}"))
+    if nav:
+        m.row(*nav)
+    m.row(btn_green("▶️ تشغيل كل مشاريعه", f"admuall_go_{uid}"), btn_red("⏹ إيقاف الكل", f"admuall_st_{uid}"))
+    m.row(btn_blue("🔄 تحديث", f"admusv_{uid}_{page}"), btn_gray("🔙 رجوع", "admusr_0"))
+    txt = (f"<b>👤 {esc(_user_display(uid))}</b> · <code>{uid}</code>\n"
+           f"📦 المشاريع: <code>{len(projs)}</code> · 🟢 شغّال: <code>{run}</code>\n\n" + "\n".join(lines))
+    _show(call, txt, m)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("admusv_"))
+def cb_adm_user_view(call):
+    if not is_admin(call.from_user.id):
+        return
+    uid, page = _parse_uid_page(call.data, "admusv_")
+    if uid is None:
+        return
+    bot.answer_callback_query(call.id)
+    _render_user_view(call, uid, page)
+
+
+def _parse_pid_uid(data, prefix):
+    rest = data[len(prefix):].split("_")
+    try:
+        return int(rest[0]), int(rest[1])
+    except Exception:
+        return None, None
+
+
+def _adm_user_action(call, prefix, fn, toast, need_owner_check=True):
+    if not is_admin(call.from_user.id):
+        return
+    pid, uid = _parse_pid_uid(call.data, prefix)
+    p = get_project(pid) if pid is not None else None
+    if not p or (need_owner_check and p[1] != uid):
+        bot.answer_callback_query(call.id, "❌ غير موجود", show_alert=True)
+        return
+    bot.answer_callback_query(call.id, toast)
+
+    def go():
+        try:
+            fn(pid)
+            log_action(call.from_user.id, "admin_project_action", f"{prefix} pid={pid} owner={uid}")
+        except Exception as e:
+            print(f"[AdminUsers] {e}")
+        _render_user_view(call, uid, 0)
+    run_bg(go)
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("admug_"))
+def cb_adm_user_start(call):
+    _adm_user_action(call, "admug_", lambda pid: start_project(pid, watch=8), "▶️ جاري التشغيل...")
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("admus_") and c.data != "admus_find")
+def cb_adm_user_stop(call):
+    _adm_user_action(call, "admus_", lambda pid: stop_project(pid, reason="admin"), "⏹ جاري الإيقاف...")
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("admur_"))
+def cb_adm_user_restart(call):
+    _adm_user_action(call, "admur_", lambda pid: restart_project(pid, watch=8), "🔁 جاري إعادة التشغيل...")
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("admua_"))
+def cb_adm_user_approve(call):
+    def approve_and_start(pid):
+        set_project_approved(pid, 1)
+        start_project(pid, watch=8)
+        p = get_project(pid)
+        try:
+            bot.send_message(p[1], f"✅ <b>وافقت الإدارة على مشروعك</b> <code>{esc(p[2])}</code> وتم تشغيله.", parse_mode="HTML")
+        except Exception:
+            pass
+    _adm_user_action(call, "admua_", approve_and_start, "✅ موافقة وتشغيل...")
+
+
+def _bulk_run(chat_id, targets, action, title):
+    items = []
+    for p in targets[:60]:
+        try:
+            if action == "go":
+                ok_, _m, _i = start_project(p[0], watch=6, source="manual")
+            else:
+                ok_, _m = stop_project(p[0], reason="admin")
+        except Exception:
+            ok_ = False
+        items.append((esc(p[2]), bool(ok_)))
+    if not items:
+        bot.send_message(chat_id, "ℹ️ لا توجد مشاريع مناسبة لهذا الإجراء.")
+        return
+    bot.send_message(chat_id, render_progress(title, "✅", "❌", items), parse_mode="HTML")
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("admuall_go_") or c.data.startswith("admuall_st_"))
+def cb_adm_user_bulk(call):
+    if not is_admin(call.from_user.id):
+        return
+    go = call.data.startswith("admuall_go_")
+    uid, _ = _parse_uid_page(call.data, "admuall_go_" if go else "admuall_st_")
+    if uid is None:
+        return
+    projs = get_projects_by_owner(uid)
+    if go:
+        targets = [p for p in projs if not is_running(p[0]) and get_project_approved(p[0]) == 1]
+    else:
+        targets = [p for p in projs if is_running(p[0])]
+    bot.answer_callback_query(call.id, f"{'▶️ تشغيل' if go else '⏹ إيقاف'} {len(targets)} مشروع...")
+    chat_id = call.message.chat.id
+
+    def work():
+        _bulk_run(chat_id, targets, "go" if go else "st", "▶️ نتيجة التشغيل" if go else "⏹ نتيجة الإيقاف")
+        _render_user_view(call, uid, 0)
+    run_bg(work)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "admall_go")
+def cb_adm_all_confirm(call):
+    if not is_admin(call.from_user.id):
+        return
+    bot.answer_callback_query(call.id)
+    n = sum(1 for p in get_all_projects() if not is_running(p[0]) and get_project_approved(p[0]) == 1
+            and pstate_get(p[0]).get("desired") != "never")
+    m = types.InlineKeyboardMarkup(row_width=2)
+    m.row(btn_green("✅ نعم، شغّلها", "admall_ok"), btn_gray("❌ إلغاء", "admusr_0"))
+    _show(call, f"⚠️ <b>تشغيل كل المشاريع المتوقفة والمعتمدة</b>\n\nالعدد: <code>{n}</code>\n"
+                "ستُشغَّل تباعاً (بفاصل ثانيتين) لتجنب ضغط السيرفر.", m)
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "admall_ok")
+def cb_adm_all_go(call):
+    if not is_admin(call.from_user.id):
+        return
+    targets = [p for p in get_all_projects() if not is_running(p[0]) and get_project_approved(p[0]) == 1]
+    bot.answer_callback_query(call.id, f"▶️ تشغيل {len(targets)} مشروع...")
+    chat_id = call.message.chat.id
+
+    def work():
+        items = []
+        for p in targets[:100]:
+            ok_, _m, _i = start_project(p[0], watch=6, source="manual")
+            items.append((esc(p[2]), bool(ok_)))
+            time.sleep(2)
+        bot.send_message(chat_id, render_progress("▶️ تشغيل كل المتوقفة", "✅", "❌", items) if items
+                         else "ℹ️ لا توجد مشاريع متوقفة.", parse_mode="HTML")
+    run_bg(work)
 
 
 def _html_mode(k):
